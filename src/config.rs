@@ -12,6 +12,7 @@ pub struct AppConfig {
     pub feeder: FeederSection,
     pub brokers: BrokersSection,
     pub admin: Option<AdminSection>,
+    pub master_scheduler: Option<MasterSchedulerSection>,
     pub channels: ChannelsSection,
     pub runtime: Option<RuntimeSection>,
 }
@@ -92,6 +93,14 @@ pub struct ChannelsSection {
 pub struct AdminSection {
     pub enabled: bool,
     pub bind_addr: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct MasterSchedulerSection {
+    pub enabled: bool,
+    pub time_ist: String,
+    pub weekdays_only: bool,
+    pub brokers: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

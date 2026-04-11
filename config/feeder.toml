@@ -41,6 +41,12 @@ MCX_COM = "https://public.fyers.in/sym_details/MCX_COM_sym_master.json"
 enabled = true
 bind_addr = "127.0.0.1:8787"
 
+[master_scheduler]
+enabled = true
+time_ist = "08:00"
+weekdays_only = false
+brokers = ["DELTA", "FYERS"]
+
 [channels]
 price_tick = true
 price_candles = []

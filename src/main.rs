@@ -4,6 +4,7 @@ use dhancred_trading_app::adapters::run_feed_brokers;
 use dhancred_trading_app::admin::start_admin_server;
 use dhancred_trading_app::config::AppConfig;
 use dhancred_trading_app::feeder::FeedError;
+use dhancred_trading_app::master_scheduler::start_master_scheduler;
 
 fn main() -> Result<(), FeedError> {
     dotenvy::dotenv().ok();
@@ -20,6 +21,7 @@ fn main() -> Result<(), FeedError> {
     }
 
     let _admin_server = start_admin_server(&config)?;
+    let _master_scheduler = start_master_scheduler(&config)?;
 
     run_feed_brokers(&config, configured_max_events(&config)?)
 }
