@@ -1,0 +1,2 @@
+instrument_name,instrument_type,strike,expiry,broker,instrument_token,trading_symbol,exchange,segment,underlying,lot_size,tick_size,tradable
+.DEXBTUSD,SPOT,,,DELTA,.DEXBTUSD,.DEXBTUSD,DELTA,SPOT,BTC,1,0.5,true

@@ -1,0 +1,4 @@
+instrument_name,instrument_type,strike,expiry,broker,instrument_token,trading_symbol,exchange,segment,underlying,lot_size,tick_size,tradable
+NIFTY,SPOT,,,FYERS,101000000026000,NSE:NIFTY50-INDEX,NSE,SPOT,NIFTY,1,0.05,true
+NIFTYBANK,SPOT,,,FYERS,101000000026009,NSE:NIFTYBANK-INDEX,NSE,SPOT,BANKNIFTY,1,0.05,true
+SENSEX,SPOT,,,FYERS,12100000001,BSE:SENSEX-INDEX,BSE,SPOT,SENSEX,1,0.01,true

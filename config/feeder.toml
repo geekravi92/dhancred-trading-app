@@ -1,0 +1,49 @@
+[feeder]
+mode = "live"
+feed_brokers = ["DELTA"]
+
+[brokers.delta]
+enabled = true
+base_instruments_csv = "config/instruments/delta/base_instruments.csv"
+derivatives_csv = "data/instruments/delta/derivatives.csv"
+master_csv = "data/instruments/delta/master/products.csv"
+instrument_types = ["PERP_FUT", "FUT", "CALL", "PUT"]
+strike_distance_pct = 5.0
+refresh_trigger_pct = 4.5
+rest_url_env = "DELTA_REST_URL"
+ws_public_url_env = "DELTA_WS_PUBLIC_URL"
+ws_private_url_env = "DELTA_WS_PRIVATE_URL"
+api_key_env = "DELTA_API_KEY"
+api_secret_env = "DELTA_API_SECRET"
+
+[brokers.fyers]
+enabled = true
+base_instruments_csv = "config/instruments/fyers/base_instruments.csv"
+derivatives_csv = "data/instruments/fyers/derivatives.csv"
+master_data_dir = "data/instruments/fyers/master"
+instrument_types = ["FUT", "CALL", "PUT"]
+strike_distance_pct = 2.0
+refresh_trigger_pct = 1.5
+data_ws_url = "wss://api.fyers.in/socket/v2/data/"
+app_id_env = "FYERS_APP_ID"
+access_token_file = "runtime/secrets/fyers_access_token"
+
+[brokers.fyers.master_urls]
+NSE_CD = "https://public.fyers.in/sym_details/NSE_CD_sym_master.json"
+NSE_FO = "https://public.fyers.in/sym_details/NSE_FO_sym_master.json"
+NSE_COM = "https://public.fyers.in/sym_details/NSE_COM_sym_master.json"
+NSE_CM = "https://public.fyers.in/sym_details/NSE_CM_sym_master.json"
+BSE_CM = "https://public.fyers.in/sym_details/BSE_CM_sym_master.json"
+BSE_FO = "https://public.fyers.in/sym_details/BSE_FO_sym_master.json"
+MCX_COM = "https://public.fyers.in/sym_details/MCX_COM_sym_master.json"
+
+[admin]
+enabled = true
+bind_addr = "127.0.0.1:8787"
+
+[channels]
+price_tick = true
+price_candles = []
+
+[runtime]
+max_events = 25

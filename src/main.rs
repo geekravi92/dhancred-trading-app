@@ -1,0 +1,39 @@
+use std::env;
+
+use dhancred_trading_app::adapters::run_feed_brokers;
+use dhancred_trading_app::admin::start_admin_server;
+use dhancred_trading_app::config::AppConfig;
+use dhancred_trading_app::feeder::FeedError;
+
+fn main() -> Result<(), FeedError> {
+    dotenvy::dotenv().ok();
+
+    let config_path =
+        env::var("FEEDER_CONFIG_PATH").unwrap_or_else(|_| "config/feeder.toml".to_string());
+    let config = AppConfig::load(&config_path)?;
+
+    if !config.feeder.mode.eq_ignore_ascii_case("LIVE") {
+        return Err(FeedError::Config(format!(
+            "unsupported feeder mode {}",
+            config.feeder.mode
+        )));
+    }
+
+    let _admin_server = start_admin_server(&config)?;
+
+    run_feed_brokers(&config, configured_max_events(&config)?)
+}
+
+fn configured_max_events(config: &AppConfig) -> Result<usize, FeedError> {
+    if let Ok(value) = env::var("FEEDER_MAX_EVENTS") {
+        return value
+            .parse()
+            .map_err(|error| FeedError::Config(format!("invalid FEEDER_MAX_EVENTS: {error}")));
+    }
+
+    Ok(config
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.max_events)
+        .unwrap_or(25))
+}
