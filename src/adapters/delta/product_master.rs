@@ -324,24 +324,38 @@ pub fn ensure_delta_master_csv(
     client: &DeltaProductClient,
     path: impl AsRef<Path>,
 ) -> Result<(), FeedError> {
+    ensure_delta_master_csv_with_logging(client, path, true)
+}
+
+pub fn ensure_delta_master_csv_with_logging(
+    client: &DeltaProductClient,
+    path: impl AsRef<Path>,
+    log_to_console: bool,
+) -> Result<(), FeedError> {
     let path = path.as_ref();
     let today_epoch_day = current_epoch_day()?;
     if is_fresh_for_epoch_day(path, today_epoch_day)? {
-        println!(
-            "Delta product master cached: {} instruments | {}",
-            count_csv_instruments(path)?,
-            path.display()
-        );
+        if log_to_console {
+            println!(
+                "Delta product master cached: {} instruments | {}",
+                count_csv_instruments(path)?,
+                path.display()
+            );
+        }
         return Ok(());
     }
 
-    println!("Delta product master downloading");
+    if log_to_console {
+        println!("Delta product master downloading");
+    }
     let instrument_count = client.write_live_products_csv(path)?;
-    println!(
-        "Delta product master downloaded: {} instruments | {}",
-        instrument_count,
-        path.display()
-    );
+    if log_to_console {
+        println!(
+            "Delta product master downloaded: {} instruments | {}",
+            instrument_count,
+            path.display()
+        );
+    }
 
     Ok(())
 }

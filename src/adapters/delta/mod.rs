@@ -1,5 +1,6 @@
 use crate::feeder::{FeedChannel, FeedError, FeedSubscription, Feeder, PriceEvent};
 
+pub mod latest_price_file;
 pub mod live;
 pub mod product_master;
 pub mod runtime;
