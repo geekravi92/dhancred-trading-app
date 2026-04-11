@@ -75,12 +75,24 @@ pub struct FyersBrokerSection {
     pub data_ws_url: String,
     pub app_id_env: String,
     pub access_token_file: String,
+    pub market_sessions: Option<Vec<FyersMarketSessionSection>>,
 }
 
 impl FyersBrokerSection {
     pub fn app_id(&self) -> Result<String, FeedError> {
         env_from_name(&self.app_id_env)
     }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct FyersMarketSessionSection {
+    pub enabled: bool,
+    pub name: String,
+    pub timezone: String,
+    pub open_ist: String,
+    pub close_ist: String,
+    pub connect_before_open_secs: u64,
+    pub weekdays_only: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]

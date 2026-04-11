@@ -37,6 +37,51 @@ BSE_CM = "https://public.fyers.in/sym_details/BSE_CM_sym_master.json"
 BSE_FO = "https://public.fyers.in/sym_details/BSE_FO_sym_master.json"
 MCX_COM = "https://public.fyers.in/sym_details/MCX_COM_sym_master.json"
 
+[[brokers.fyers.market_sessions]]
+enabled = true
+name = "NSE_BSE_EQUITY"
+timezone = "Asia/Kolkata"
+open_ist = "09:15"
+close_ist = "15:30"
+connect_before_open_secs = 300
+weekdays_only = true
+
+[[brokers.fyers.market_sessions]]
+enabled = true
+name = "INDIA_CURRENCY"
+timezone = "Asia/Kolkata"
+open_ist = "09:00"
+close_ist = "17:00"
+connect_before_open_secs = 300
+weekdays_only = true
+
+[[brokers.fyers.market_sessions]]
+enabled = true
+name = "INDIA_AGRI_COMMODITY"
+timezone = "Asia/Kolkata"
+open_ist = "09:00"
+close_ist = "17:00"
+connect_before_open_secs = 300
+weekdays_only = true
+
+[[brokers.fyers.market_sessions]]
+enabled = true
+name = "INDIA_INTL_AGRI_COMMODITY"
+timezone = "Asia/Kolkata"
+open_ist = "09:00"
+close_ist = "21:00"
+connect_before_open_secs = 300
+weekdays_only = true
+
+[[brokers.fyers.market_sessions]]
+enabled = true
+name = "INDIA_NON_AGRI_COMMODITY"
+timezone = "Asia/Kolkata"
+open_ist = "09:00"
+close_ist = "23:30"
+connect_before_open_secs = 300
+weekdays_only = true
+
 [admin]
 enabled = true
 bind_addr = "127.0.0.1:8787"

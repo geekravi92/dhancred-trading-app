@@ -1,4 +1,5 @@
 pub mod master;
+pub mod session;
 pub mod token;
 
 use crate::config::FyersBrokerSection;
@@ -24,6 +25,8 @@ pub fn run_live(config: &FyersBrokerSection, _max_events: usize) -> Result<(), F
             summary.output_path.display()
         );
     }
+
+    session::wait_for_market_session(config.market_sessions.as_deref())?;
 
     Err(FeedError::Config(
         "FYERS live WebSocket integration is not implemented yet".to_string(),
