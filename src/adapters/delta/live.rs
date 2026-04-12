@@ -11,19 +11,20 @@ use crate::feeder::{
     UnixMillis,
 };
 
-const DELTA_TRADES_CHANNEL: &str = "trades";
+const DEFAULT_DELTA_TICKER_CHANNEL: &str = "v2/ticker";
 const DELTA_SPOT_PRICE_CHANNEL: &str = "spot_price";
 
 type DeltaWebSocket = WebSocket<MaybeTlsStream<TcpStream>>;
 
 pub struct DeltaLiveFeeder {
     socket: DeltaWebSocket,
-    subscribed_trade_symbols: BTreeSet<String>,
+    ticker_channel: String,
+    subscribed_ticker_symbols: BTreeSet<String>,
     subscribed_spot_symbols: BTreeSet<String>,
 }
 
 impl DeltaLiveFeeder {
-    pub fn connect(ws_url: &str) -> Result<Self, FeedError> {
+    pub fn connect(ws_url: &str, ticker_channel: Option<&str>) -> Result<Self, FeedError> {
         let (mut socket, _response) = connect(ws_url)?;
         socket.send(Message::Text(
             json!({ "type": "enable_heartbeat" }).to_string().into(),
@@ -31,7 +32,11 @@ impl DeltaLiveFeeder {
 
         Ok(Self {
             socket,
-            subscribed_trade_symbols: BTreeSet::new(),
+            ticker_channel: ticker_channel
+                .filter(|channel| !channel.trim().is_empty())
+                .unwrap_or(DEFAULT_DELTA_TICKER_CHANNEL)
+                .to_string(),
+            subscribed_ticker_symbols: BTreeSet::new(),
             subscribed_spot_symbols: BTreeSet::new(),
         })
     }
@@ -40,7 +45,7 @@ impl DeltaLiveFeeder {
         let symbols = symbols
             .iter()
             .filter(|symbol| !symbol.trim().is_empty())
-            .filter(|symbol| !self.subscribed_trade_symbols.contains(*symbol))
+            .filter(|symbol| !self.subscribed_ticker_symbols.contains(*symbol))
             .cloned()
             .collect::<Vec<_>>();
 
@@ -48,15 +53,16 @@ impl DeltaLiveFeeder {
             return Ok(());
         }
 
-        self.send_channel_message("subscribe", DELTA_TRADES_CHANNEL, &symbols)?;
-        self.subscribed_trade_symbols.extend(symbols);
+        let channel = self.ticker_channel.clone();
+        self.send_channel_message("subscribe", &channel, &symbols)?;
+        self.subscribed_ticker_symbols.extend(symbols);
         Ok(())
     }
 
     pub fn unsubscribe_symbols(&mut self, symbols: &[String]) -> Result<(), FeedError> {
         let symbols = symbols
             .iter()
-            .filter(|symbol| self.subscribed_trade_symbols.contains(*symbol))
+            .filter(|symbol| self.subscribed_ticker_symbols.contains(*symbol))
             .cloned()
             .collect::<Vec<_>>();
 
@@ -64,9 +70,10 @@ impl DeltaLiveFeeder {
             return Ok(());
         }
 
-        self.send_channel_message("unsubscribe", DELTA_TRADES_CHANNEL, &symbols)?;
+        let channel = self.ticker_channel.clone();
+        self.send_channel_message("unsubscribe", &channel, &symbols)?;
         for symbol in symbols {
-            self.subscribed_trade_symbols.remove(&symbol);
+            self.subscribed_ticker_symbols.remove(&symbol);
         }
 
         Ok(())
@@ -166,14 +173,92 @@ impl Feeder for DeltaLiveFeeder {
 
 pub fn parse_delta_text_message(text: &str) -> Result<Option<PriceEvent>, FeedError> {
     let value: Value = serde_json::from_str(text)?;
+    if value.get("success").and_then(Value::as_bool) == Some(false) {
+        return Err(FeedError::Parse(format!("Delta websocket error: {value}")));
+    }
     let message_type = value.get("type").and_then(Value::as_str);
 
     match message_type {
+        Some("v2/ticker") | Some("ticker") => parse_ticker_tick(&value).map(Some),
         Some("trades") => parse_trade_tick(&value).map(Some),
         Some("v2/spot_price") | Some("spot_price") => parse_spot_price_tick(&value).map(Some),
         Some("heartbeat") | Some("subscriptions") => Ok(None),
+        Some("error") => Err(FeedError::Parse(format!("Delta websocket error: {value}"))),
         _ => Ok(None),
     }
+}
+
+fn parse_ticker_tick(value: &Value) -> Result<PriceEvent, FeedError> {
+    let symbol = ticker_symbol(value)
+        .ok_or_else(|| FeedError::Parse(format!("Delta ticker missing symbol: {value}")))?;
+    let price = ticker_price(value)
+        .ok_or_else(|| FeedError::Parse(format!("Delta ticker missing price: {value}")))?;
+    let time_micros = value
+        .get("timestamp")
+        .or_else(|| value.get("t"))
+        .or_else(|| value.get("ts"))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(current_unix_micros);
+
+    let price = Price::new(price).map_err(|error| FeedError::Parse(error.to_string()))?;
+
+    Ok(PriceEvent::Tick(PriceTick::new(
+        InstrumentName::new(symbol),
+        price,
+        UnixMillis::new(time_micros / 1000),
+    )))
+}
+
+fn ticker_symbol(value: &Value) -> Option<&str> {
+    value
+        .get("symbol")
+        .or_else(|| value.get("sy"))
+        .or_else(|| value.get("s"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            compact_ticker_payload(value).and_then(|payload| {
+                payload
+                    .get("symbol")
+                    .or_else(|| payload.get("sy"))
+                    .or_else(|| payload.get("s"))
+                    .and_then(Value::as_str)
+            })
+        })
+}
+
+fn ticker_price(value: &Value) -> Option<f64> {
+    parse_json_number(
+        value
+            .get("close")
+            .or_else(|| value.get("price"))
+            .or_else(|| value.get("last_price"))
+            .or_else(|| value.get("last_traded_price"))
+            .or_else(|| value.get("mark_price"))
+            .or_else(|| value.get("spot_price")),
+    )
+    .or_else(|| compact_ticker_payload(value).and_then(compact_ticker_price))
+}
+
+fn compact_ticker_payload(value: &Value) -> Option<&Value> {
+    value.get("d").and_then(Value::as_array)?.first()
+}
+
+fn compact_ticker_price(value: &Value) -> Option<f64> {
+    parse_json_number(
+        value
+            .get("close")
+            .or_else(|| value.get("price"))
+            .or_else(|| value.get("last_price"))
+            .or_else(|| value.get("last_traded_price")),
+    )
+    .or_else(|| {
+        value
+            .get("ohlc")
+            .and_then(Value::as_array)
+            .and_then(|ohlc| ohlc.get(3))
+            .and_then(|close| parse_json_number(Some(close)))
+    })
+    .or_else(|| parse_json_number(value.get("m").or_else(|| value.get("mark_price"))))
 }
 
 fn parse_trade_tick(value: &Value) -> Result<PriceEvent, FeedError> {
@@ -260,6 +345,71 @@ mod tests {
         assert!(matches!(event, PriceEvent::Tick(_)));
         assert_eq!(event.instrument_name(), &InstrumentName::new("BTCUSD"));
         assert_eq!(event.price().as_f64(), 72_141.5);
+    }
+
+    #[test]
+    fn parses_v2_ticker_into_price_tick() {
+        let message = r#"{
+            "close": 71810.0,
+            "mark_price": "71805.1",
+            "symbol": "BTCUSD",
+            "timestamp": 1775800366578410,
+            "type": "v2/ticker"
+        }"#;
+
+        let event = parse_delta_text_message(message).unwrap().unwrap();
+
+        assert!(matches!(event, PriceEvent::Tick(_)));
+        assert_eq!(event.instrument_name(), &InstrumentName::new("BTCUSD"));
+        assert_eq!(event.price().as_f64(), 71_810.0);
+    }
+
+    #[test]
+    fn parses_v2_ticker_mark_price_fallback_into_price_tick() {
+        let message = r#"{
+            "mark_price": "294.0",
+            "symbol": "C-BTC-71800-120426",
+            "timestamp": 1775800366578410,
+            "type": "v2/ticker"
+        }"#;
+
+        let event = parse_delta_text_message(message).unwrap().unwrap();
+
+        assert!(matches!(event, PriceEvent::Tick(_)));
+        assert_eq!(
+            event.instrument_name(),
+            &InstrumentName::new("C-BTC-71800-120426")
+        );
+        assert_eq!(event.price().as_f64(), 294.0);
+    }
+
+    #[test]
+    fn parses_compact_delta_india_ticker_into_price_tick() {
+        let message = r#"{
+            "d": [
+                {
+                    "g": ["-0.98795059", "0.00004200", "-0.72992386", "-31.84982882", "0.71285309"],
+                    "i": 130334,
+                    "m": "1715.50081572",
+                    "m24hc": "218.6193",
+                    "ohlc": [575.0, 2000.0, 161.0, 1714.3],
+                    "s": "P-BTC-73400-120426"
+                }
+            ],
+            "sp": "71687.1",
+            "sy": "P-BTC-73400-120426",
+            "ts": 1775963473692921,
+            "type": "ticker"
+        }"#;
+
+        let event = parse_delta_text_message(message).unwrap().unwrap();
+
+        assert!(matches!(event, PriceEvent::Tick(_)));
+        assert_eq!(
+            event.instrument_name(),
+            &InstrumentName::new("P-BTC-73400-120426")
+        );
+        assert_eq!(event.price().as_f64(), 1_714.3);
     }
 
     #[test]

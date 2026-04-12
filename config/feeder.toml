@@ -7,6 +7,7 @@ enabled = true
 base_instruments_csv = "config/instruments/delta/base_instruments.csv"
 derivatives_csv = "data/instruments/delta/derivatives.csv"
 master_csv = "data/instruments/delta/master/products.csv"
+ticker_channel = "ticker"
 latest_prices_file = "runtime/delta_latest_prices.txt"
 latest_prices_underlying = "BTC"
 console_logging = false
@@ -93,11 +94,11 @@ bind_addr = "127.0.0.1:8787"
 enabled = true
 time_ist = "08:00"
 weekdays_only = false
-brokers = ["DELTA", "FYERS"]
+brokers = ["DELTA"]
 
 [channels]
 price_tick = true
 price_candles = []
 
 [runtime]
-max_events = 25
+max_events = 0

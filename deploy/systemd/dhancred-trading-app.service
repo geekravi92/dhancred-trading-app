@@ -1,0 +1,16 @@
+[Unit]
+Description=Dhancred Trading App
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/dhancred-trading-app
+EnvironmentFile=/home/ubuntu/dhancred-trading-app/.env
+ExecStart=/home/ubuntu/dhancred-trading-app/dhancred-trading-app
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

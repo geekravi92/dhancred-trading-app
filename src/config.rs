@@ -42,6 +42,7 @@ pub struct DeltaBrokerSection {
     pub base_instruments_csv: String,
     pub derivatives_csv: String,
     pub master_csv: String,
+    pub ticker_channel: Option<String>,
     pub latest_prices_file: Option<String>,
     pub latest_prices_underlying: Option<String>,
     pub console_logging: Option<bool>,

@@ -20,7 +20,8 @@ pub fn run_live(config: &DeltaBrokerSection, max_events: usize) -> Result<(), Fe
     let selection = InstrumentSelection::from(config);
     let delta = DeltaProductClient::new(config.rest_url()?);
     ensure_delta_master_csv_with_logging(&delta, &config.master_csv, log_to_console)?;
-    let mut live_feeder = DeltaLiveFeeder::connect(&config.public_ws_url()?)?;
+    let mut live_feeder =
+        DeltaLiveFeeder::connect(&config.public_ws_url()?, config.ticker_channel.as_deref())?;
 
     let mut runtimes = build_underlying_runtimes(config, &spot_references);
     let spot_to_underlying = spot_to_underlying(&spot_references);
