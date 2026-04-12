@@ -16,6 +16,8 @@ use crate::feeder::{
 };
 
 const PRODUCTS_PAGE_SIZE: usize = 500;
+const DAY_SECONDS: u64 = 86_400;
+const DELTA_OPTION_SETTLEMENT_UTC_SECONDS: u64 = 12 * 60 * 60;
 
 #[derive(Clone, Debug)]
 pub struct DeltaProductClient {
@@ -417,6 +419,13 @@ fn current_epoch_day() -> Result<u64, FeedError> {
     epoch_day(SystemTime::now())
 }
 
+fn current_unix_seconds() -> Result<u64, FeedError> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| FeedError::Config(format!("system clock is before unix epoch: {error}")))?
+        .as_secs())
+}
+
 fn epoch_day(time: SystemTime) -> Result<u64, FeedError> {
     let duration = time.duration_since(UNIX_EPOCH).map_err(|error| {
         FeedError::Config(format!("system clock is before unix epoch: {error}"))
@@ -434,6 +443,7 @@ pub fn build_delta_universe_summary_from_master_csv(
 ) -> Result<DeltaUniverseSummary, FeedError> {
     let lower_strike = reference_price * (1.0 - selection.strike_distance_pct / 100.0);
     let upper_strike = reference_price * (1.0 + selection.strike_distance_pct / 100.0);
+    let now_unix_seconds = current_unix_seconds()?;
 
     let mut matching_instruments = read_matching_delta_master_instruments(
         path,
@@ -441,6 +451,7 @@ pub fn build_delta_universe_summary_from_master_csv(
         underlying,
         lower_strike,
         upper_strike,
+        now_unix_seconds,
     )?;
     matching_instruments.sort_by(|left, right| left.trading_symbol.cmp(&right.trading_symbol));
 
@@ -506,6 +517,7 @@ fn read_matching_delta_master_instruments(
     underlying: &str,
     lower_strike: f64,
     upper_strike: f64,
+    now_unix_seconds: u64,
 ) -> Result<Vec<InstrumentDefinition>, FeedError> {
     let file = File::open(path)?;
     let mut lines = BufReader::new(file).lines();
@@ -527,6 +539,9 @@ fn read_matching_delta_master_instruments(
 
         let instrument = parse_master_csv_row(&headers, &line, line_number)?;
         if instrument.underlying != underlying {
+            continue;
+        }
+        if !delta_instrument_active_at(&instrument, now_unix_seconds) {
             continue;
         }
         if !instrument_type_allowed_definition(&instrument, &selection.instrument_types) {
@@ -617,6 +632,33 @@ fn parse_bool(value: &str) -> Result<bool, FeedError> {
     }
 }
 
+fn delta_instrument_active_at(instrument: &InstrumentDefinition, now_unix_seconds: u64) -> bool {
+    if !matches!(
+        instrument.instrument_type,
+        InstrumentType::Call | InstrumentType::Put
+    ) {
+        return true;
+    }
+
+    delta_expiry_active_at(instrument.expiry.as_deref(), now_unix_seconds)
+}
+
+fn delta_product_active_at(product: &DeltaProduct, now_unix_seconds: u64) -> bool {
+    if !product.is_option() {
+        return true;
+    }
+
+    delta_expiry_active_at(product.expiry_yyyy_mm_dd().as_deref(), now_unix_seconds)
+}
+
+fn delta_expiry_active_at(expiry: Option<&str>, now_unix_seconds: u64) -> bool {
+    let Some(expiry_day) = expiry.and_then(yyyy_mm_dd_to_epoch_day) else {
+        return true;
+    };
+
+    now_unix_seconds < expiry_day * DAY_SECONDS + DELTA_OPTION_SETTLEMENT_UTC_SECONDS
+}
+
 pub fn selected_trading_symbols(summary: &DeltaUniverseSummary) -> BTreeSet<String> {
     summary
         .futures
@@ -676,10 +718,12 @@ pub fn build_delta_universe_summary(
 ) -> Result<DeltaUniverseSummary, FeedError> {
     let lower_strike = reference_price * (1.0 - selection.strike_distance_pct / 100.0);
     let upper_strike = reference_price * (1.0 + selection.strike_distance_pct / 100.0);
+    let now_unix_seconds = current_unix_seconds()?;
 
     let mut matching_products: Vec<DeltaProduct> = products
         .iter()
         .filter(|product| product.underlying().as_deref() == Some(underlying))
+        .filter(|product| delta_product_active_at(product, now_unix_seconds))
         .filter(|product| instrument_type_allowed(product, &selection.instrument_types))
         .cloned()
         .collect();
@@ -924,6 +968,27 @@ fn ddmmyy_to_yyyy_mm_dd(value: String) -> Option<String> {
     Some(format!("20{year}-{month}-{day}"))
 }
 
+fn yyyy_mm_dd_to_epoch_day(value: &str) -> Option<u64> {
+    if value.len() != 10 {
+        return None;
+    }
+
+    let year = value.get(0..4)?.parse().ok()?;
+    let month = value.get(5..7)?.parse().ok()?;
+    let day = value.get(8..10)?.parse().ok()?;
+    days_from_civil(year, month, day).try_into().ok()
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
 fn parse_decimal(value: &str) -> Option<f64> {
     value.trim().parse().ok()
 }
@@ -980,6 +1045,31 @@ mod tests {
                 spot_symbol: ".DEXBTUSD".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn delta_options_expire_at_12_utc_on_expiry_date() {
+        let option = InstrumentDefinition {
+            instrument_name: InstrumentName::new("C-BTC-70800-120426"),
+            instrument_type: InstrumentType::Call,
+            strike: Some(70_800.0),
+            expiry: Some("2026-04-12".to_string()),
+            broker: "DELTA".to_string(),
+            instrument_token: "130262".to_string(),
+            trading_symbol: "C-BTC-70800-120426".to_string(),
+            exchange: "DELTA".to_string(),
+            segment: "CALL".to_string(),
+            underlying: "BTC".to_string(),
+            lot_size: 0.001,
+            tick_size: 0.1,
+            tradable: true,
+        };
+        let expiry_day = yyyy_mm_dd_to_epoch_day("2026-04-12").expect("expiry day");
+        let before_settlement = expiry_day * DAY_SECONDS + DELTA_OPTION_SETTLEMENT_UTC_SECONDS - 1;
+        let at_settlement = expiry_day * DAY_SECONDS + DELTA_OPTION_SETTLEMENT_UTC_SECONDS;
+
+        assert!(delta_instrument_active_at(&option, before_settlement));
+        assert!(!delta_instrument_active_at(&option, at_settlement));
     }
 
     fn test_product_with_spot_index(id: u64, symbol: &str, spot_symbol: &str) -> DeltaProduct {

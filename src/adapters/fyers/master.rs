@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -12,9 +13,10 @@ use serde::de::{self, MapAccess, Visitor};
 use serde_json::{Map, Value};
 
 use crate::config::FyersBrokerSection;
+use crate::config::InstrumentSelection;
 use crate::feeder::{
     FeedError, InstrumentDefinition, InstrumentName, InstrumentType,
-    UNIVERSAL_INSTRUMENT_CSV_HEADER,
+    UNIVERSAL_INSTRUMENT_CSV_HEADER, parse_instrument_type,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -223,6 +225,303 @@ pub fn parse_master_json(
         .map_err(|error| FeedError::Parse(format!("FYERS {source} JSON parse failed: {error}")))?;
 
     parse_master_value(source, value)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FyersUniverseSummary {
+    pub selected_underlying: String,
+    pub reference_symbol: String,
+    pub reference_price: f64,
+    pub spot_or_index_symbols: Vec<String>,
+    pub futures: Vec<InstrumentDefinition>,
+    pub atm_options: Vec<InstrumentDefinition>,
+}
+
+pub fn build_fyers_universe_summary_from_master_csvs(
+    master_data_dir: impl AsRef<Path>,
+    selection: &InstrumentSelection,
+    underlying: &str,
+    reference_symbol: &str,
+    reference_price: f64,
+) -> Result<FyersUniverseSummary, FeedError> {
+    let lower_strike = reference_price * (1.0 - selection.strike_distance_pct / 100.0);
+    let upper_strike = reference_price * (1.0 + selection.strike_distance_pct / 100.0);
+
+    let mut matching_instruments = read_matching_fyers_master_instruments(
+        master_data_dir,
+        selection,
+        underlying,
+        lower_strike,
+        upper_strike,
+    )?;
+    matching_instruments.sort_by(|left, right| left.trading_symbol.cmp(&right.trading_symbol));
+
+    let mut spot_or_index_symbols = matching_instruments
+        .iter()
+        .filter(|instrument| instrument.instrument_type == InstrumentType::Spot)
+        .map(|instrument| instrument.trading_symbol.clone())
+        .collect::<Vec<_>>();
+    if spot_or_index_symbols.is_empty() {
+        spot_or_index_symbols.push(reference_symbol.to_string());
+    }
+    spot_or_index_symbols.sort();
+    spot_or_index_symbols.dedup();
+
+    let futures = matching_instruments
+        .iter()
+        .filter(|instrument| instrument.instrument_type == InstrumentType::Fut)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut atm_options = matching_instruments
+        .iter()
+        .filter(|instrument| {
+            matches!(
+                instrument.instrument_type,
+                InstrumentType::Call | InstrumentType::Put
+            )
+        })
+        .filter(|instrument| {
+            instrument
+                .strike
+                .is_some_and(|strike| strike >= lower_strike && strike <= upper_strike)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    atm_options.sort_by(|left, right| {
+        let left_distance = (left.strike.unwrap_or(f64::MAX) - reference_price).abs();
+        let right_distance = (right.strike.unwrap_or(f64::MAX) - reference_price).abs();
+        left_distance
+            .total_cmp(&right_distance)
+            .then_with(|| left.trading_symbol.cmp(&right.trading_symbol))
+    });
+
+    Ok(FyersUniverseSummary {
+        selected_underlying: underlying.to_string(),
+        reference_symbol: reference_symbol.to_string(),
+        reference_price,
+        spot_or_index_symbols,
+        futures,
+        atm_options,
+    })
+}
+
+pub fn selected_trading_symbols(summary: &FyersUniverseSummary) -> BTreeSet<String> {
+    summary
+        .futures
+        .iter()
+        .chain(summary.atm_options.iter())
+        .filter(|instrument| instrument.tradable)
+        .map(|instrument| instrument.trading_symbol.clone())
+        .collect()
+}
+
+pub fn write_fyers_derivatives_csv(
+    summaries: &[FyersUniverseSummary],
+    path: impl AsRef<Path>,
+) -> Result<(), FeedError> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| FeedError::Config("invalid FYERS derivatives CSV path".to_string()))?;
+    let tmp_path = path.with_file_name(format!("{file_name}.tmp"));
+    let mut writer = BufWriter::new(File::create(&tmp_path)?);
+    writeln!(writer, "{UNIVERSAL_INSTRUMENT_CSV_HEADER}")?;
+
+    let mut rows = summaries
+        .iter()
+        .flat_map(|summary| summary.futures.iter().chain(summary.atm_options.iter()))
+        .filter(|instrument| instrument.tradable)
+        .map(InstrumentDefinition::to_csv_row)
+        .collect::<Vec<_>>();
+    rows.sort();
+    rows.dedup();
+
+    for row in rows {
+        writeln!(writer, "{row}")?;
+    }
+
+    writer.flush()?;
+    drop(writer);
+    fs::rename(tmp_path, path)?;
+
+    Ok(())
+}
+
+pub fn print_fyers_universe_summary(summary: &FyersUniverseSummary) {
+    println!("FYERS symbol master loaded");
+    println!(
+        "Underlying: {} | reference: {} @ {:.4}",
+        summary.selected_underlying, summary.reference_symbol, summary.reference_price
+    );
+    println!(
+        "Selected instruments: futures={} options={}",
+        summary.futures.len(),
+        summary.atm_options.len()
+    );
+}
+
+fn read_matching_fyers_master_instruments(
+    master_data_dir: impl AsRef<Path>,
+    selection: &InstrumentSelection,
+    underlying: &str,
+    lower_strike: f64,
+    upper_strike: f64,
+) -> Result<Vec<InstrumentDefinition>, FeedError> {
+    let mut paths = fs::read_dir(master_data_dir.as_ref())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "csv"))
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    let mut instruments = Vec::new();
+    for path in paths {
+        read_matching_fyers_master_csv(
+            &path,
+            selection,
+            underlying,
+            lower_strike,
+            upper_strike,
+            &mut instruments,
+        )?;
+    }
+
+    Ok(instruments)
+}
+
+fn read_matching_fyers_master_csv(
+    path: &Path,
+    selection: &InstrumentSelection,
+    underlying: &str,
+    lower_strike: f64,
+    upper_strike: f64,
+    instruments: &mut Vec<InstrumentDefinition>,
+) -> Result<(), FeedError> {
+    let file = File::open(path)?;
+    let mut lines = BufReader::new(file).lines();
+    let header_line = lines.next().ok_or_else(|| {
+        FeedError::Parse(format!("FYERS master CSV {} is empty", path.display()))
+    })??;
+    let headers = header_line
+        .split(',')
+        .map(|value| value.trim().to_string())
+        .collect::<Vec<_>>();
+
+    for (index, line) in lines.enumerate() {
+        let line_number = index + 2;
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let instrument = parse_universal_csv_row(&headers, &line, line_number, path)?;
+        if instrument.underlying != underlying {
+            continue;
+        }
+        if !instrument_type_allowed_definition(&instrument, &selection.instrument_types) {
+            continue;
+        }
+        if matches!(
+            instrument.instrument_type,
+            InstrumentType::Call | InstrumentType::Put
+        ) && !instrument
+            .strike
+            .is_some_and(|strike| strike >= lower_strike && strike <= upper_strike)
+        {
+            continue;
+        }
+
+        instruments.push(instrument);
+    }
+
+    Ok(())
+}
+
+fn parse_universal_csv_row(
+    headers: &[String],
+    line: &str,
+    line_number: usize,
+    path: &Path,
+) -> Result<InstrumentDefinition, FeedError> {
+    let values = line.split(',').map(str::trim).collect::<Vec<_>>();
+    if values.len() != headers.len() {
+        return Err(FeedError::Parse(format!(
+            "FYERS master CSV {} line {line_number} has {} fields, expected {}",
+            path.display(),
+            values.len(),
+            headers.len()
+        )));
+    }
+
+    let get = |name: &str| -> Result<&str, FeedError> {
+        headers
+            .iter()
+            .position(|header| header == name)
+            .map(|position| values[position])
+            .ok_or_else(|| FeedError::Parse(format!("missing FYERS master CSV column {name}")))
+    };
+
+    Ok(InstrumentDefinition {
+        instrument_name: InstrumentName::new(get("instrument_name")?),
+        instrument_type: parse_instrument_type(get("instrument_type")?)?,
+        strike: parse_optional_csv_f64(get("strike")?)?,
+        expiry: parse_optional_csv_string(get("expiry")?),
+        broker: get("broker")?.to_string(),
+        instrument_token: get("instrument_token")?.to_string(),
+        trading_symbol: get("trading_symbol")?.to_string(),
+        exchange: get("exchange")?.to_string(),
+        segment: get("segment")?.to_string(),
+        underlying: get("underlying")?.to_string(),
+        lot_size: parse_required_csv_f64(get("lot_size")?)?,
+        tick_size: parse_required_csv_f64(get("tick_size")?)?,
+        tradable: parse_csv_bool(get("tradable")?)?,
+    })
+}
+
+fn instrument_type_allowed_definition(
+    instrument: &InstrumentDefinition,
+    allowed_types: &[String],
+) -> bool {
+    allowed_types.is_empty()
+        || allowed_types
+            .iter()
+            .any(|allowed_type| allowed_type == instrument.instrument_type.as_str())
+}
+
+fn parse_optional_csv_string(value: &str) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn parse_optional_csv_f64(value: &str) -> Result<Option<f64>, FeedError> {
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        parse_required_csv_f64(value).map(Some)
+    }
+}
+
+fn parse_required_csv_f64(value: &str) -> Result<f64, FeedError> {
+    value
+        .parse()
+        .map_err(|error| FeedError::Parse(format!("invalid f64 {value}: {error}")))
+}
+
+fn parse_csv_bool(value: &str) -> Result<bool, FeedError> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(FeedError::Parse(format!("invalid bool {value}"))),
+    }
 }
 
 fn parse_master_value(source: &str, value: Value) -> Result<Vec<InstrumentDefinition>, FeedError> {
@@ -551,5 +850,53 @@ mod tests {
         assert_eq!(instruments[0].segment, "CALL");
         assert_eq!(instruments[1].instrument_type, InstrumentType::Fut);
         assert_eq!(instruments[1].lot_size, 65.0);
+    }
+
+    #[test]
+    fn selects_fyers_derivative_universe_from_master_csvs() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("dhancred-fyers-master-test-{}", std::process::id()));
+        let master_dir = temp_dir.join("master");
+        fs::create_dir_all(&master_dir).expect("created test master dir");
+        let master_csv = master_dir.join("NSE_FO.csv");
+        fs::write(
+            &master_csv,
+            [
+                UNIVERSAL_INSTRUMENT_CSV_HEADER,
+                "NIFTY,SPOT,,,FYERS,101000000026000,NSE:NIFTY50-INDEX,NSE,SPOT,NIFTY,1,0.05,true",
+                "NIFTY26APRFUT,FUT,,2026-04-30,FYERS,101126043051714,NSE:NIFTY26APRFUT,NSE,FUT,NIFTY,65,0.05,true",
+                "NIFTY26APR25000CE,CALL,25000,2026-04-30,FYERS,101126043000001,NSE:NIFTY26APR25000CE,NSE,CALL,NIFTY,65,0.05,true",
+                "NIFTY26APR25000PE,PUT,25000,2026-04-30,FYERS,101126043000002,NSE:NIFTY26APR25000PE,NSE,PUT,NIFTY,65,0.05,true",
+                "NIFTY26APR25600CE,CALL,25600,2026-04-30,FYERS,101126043000003,NSE:NIFTY26APR25600CE,NSE,CALL,NIFTY,65,0.05,true",
+                "BANKNIFTY26APR25000CE,CALL,25000,2026-04-30,FYERS,101126043000004,NSE:BANKNIFTY26APR25000CE,NSE,CALL,BANKNIFTY,35,0.05,true",
+            ]
+            .join("\n"),
+        )
+        .expect("wrote test master CSV");
+
+        let selection = InstrumentSelection {
+            instrument_types: vec!["FUT".to_string(), "CALL".to_string(), "PUT".to_string()],
+            strike_distance_pct: 2.0,
+            refresh_trigger_pct: 1.5,
+        };
+        let summary = build_fyers_universe_summary_from_master_csvs(
+            &master_dir,
+            &selection,
+            "NIFTY",
+            "NSE:NIFTY50-INDEX",
+            25_000.0,
+        )
+        .expect("built universe summary");
+        let selected = selected_trading_symbols(&summary);
+
+        assert_eq!(summary.futures.len(), 1);
+        assert_eq!(summary.atm_options.len(), 2);
+        assert!(selected.contains("NSE:NIFTY26APRFUT"));
+        assert!(selected.contains("NSE:NIFTY26APR25000CE"));
+        assert!(selected.contains("NSE:NIFTY26APR25000PE"));
+        assert!(!selected.contains("NSE:NIFTY26APR25600CE"));
+        assert!(!selected.contains("NSE:BANKNIFTY26APR25000CE"));
+
+        fs::remove_dir_all(temp_dir).expect("removed test master dir");
     }
 }

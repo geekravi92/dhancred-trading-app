@@ -1,6 +1,6 @@
 [feeder]
 mode = "live"
-feed_brokers = ["DELTA"]
+feed_brokers = ["DELTA", "FYERS"]
 
 [brokers.delta]
 enabled = true
@@ -28,9 +28,10 @@ master_data_dir = "data/instruments/fyers/master"
 instrument_types = ["FUT", "CALL", "PUT"]
 strike_distance_pct = 2.0
 refresh_trigger_pct = 1.5
-data_ws_url = "wss://api.fyers.in/socket/v2/data/"
-app_id_env = "FYERS_APP_ID"
+data_ws_url = "wss://socket.fyers.in/hsm/v1-5/prod"
 access_token_file = "runtime/secrets/fyers_access_token"
+latest_prices_file = "runtime/fyers_latest_prices.txt"
+console_logging = false
 
 [brokers.fyers.master_urls]
 NSE_CD = "https://public.fyers.in/sym_details/NSE_CD_sym_master.json"
@@ -94,7 +95,7 @@ bind_addr = "127.0.0.1:8787"
 enabled = true
 time_ist = "08:00"
 weekdays_only = false
-brokers = ["DELTA"]
+brokers = ["DELTA", "FYERS"]
 
 [channels]
 price_tick = true

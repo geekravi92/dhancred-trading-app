@@ -77,15 +77,10 @@ pub struct FyersBrokerSection {
     pub strike_distance_pct: f64,
     pub refresh_trigger_pct: f64,
     pub data_ws_url: String,
-    pub app_id_env: String,
     pub access_token_file: String,
+    pub latest_prices_file: Option<String>,
+    pub console_logging: Option<bool>,
     pub market_sessions: Option<Vec<FyersMarketSessionSection>>,
-}
-
-impl FyersBrokerSection {
-    pub fn app_id(&self) -> Result<String, FeedError> {
-        env_from_name(&self.app_id_env)
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]

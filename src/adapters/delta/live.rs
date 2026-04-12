@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -13,6 +14,8 @@ use crate::feeder::{
 
 const DEFAULT_DELTA_TICKER_CHANNEL: &str = "v2/ticker";
 const DELTA_SPOT_PRICE_CHANNEL: &str = "spot_price";
+const MAX_INVALID_DELTA_PRICE_LOGS: usize = 20;
+static INVALID_DELTA_PRICE_LOGS: AtomicUsize = AtomicUsize::new(0);
 
 type DeltaWebSocket = WebSocket<MaybeTlsStream<TcpStream>>;
 
@@ -179,20 +182,22 @@ pub fn parse_delta_text_message(text: &str) -> Result<Option<PriceEvent>, FeedEr
     let message_type = value.get("type").and_then(Value::as_str);
 
     match message_type {
-        Some("v2/ticker") | Some("ticker") => parse_ticker_tick(&value).map(Some),
-        Some("trades") => parse_trade_tick(&value).map(Some),
-        Some("v2/spot_price") | Some("spot_price") => parse_spot_price_tick(&value).map(Some),
+        Some("v2/ticker") | Some("ticker") => parse_ticker_tick(&value),
+        Some("trades") => parse_trade_tick(&value),
+        Some("v2/spot_price") | Some("spot_price") => parse_spot_price_tick(&value),
         Some("heartbeat") | Some("subscriptions") => Ok(None),
         Some("error") => Err(FeedError::Parse(format!("Delta websocket error: {value}"))),
         _ => Ok(None),
     }
 }
 
-fn parse_ticker_tick(value: &Value) -> Result<PriceEvent, FeedError> {
+fn parse_ticker_tick(value: &Value) -> Result<Option<PriceEvent>, FeedError> {
     let symbol = ticker_symbol(value)
         .ok_or_else(|| FeedError::Parse(format!("Delta ticker missing symbol: {value}")))?;
-    let price = ticker_price(value)
-        .ok_or_else(|| FeedError::Parse(format!("Delta ticker missing price: {value}")))?;
+    let Some(price) = ticker_price(value) else {
+        log_ignored_delta_price("ticker", symbol, None, "missing price");
+        return Ok(None);
+    };
     let time_micros = value
         .get("timestamp")
         .or_else(|| value.get("t"))
@@ -200,13 +205,15 @@ fn parse_ticker_tick(value: &Value) -> Result<PriceEvent, FeedError> {
         .and_then(Value::as_u64)
         .unwrap_or_else(current_unix_micros);
 
-    let price = Price::new(price).map_err(|error| FeedError::Parse(error.to_string()))?;
+    let Some(price) = valid_delta_price("ticker", symbol, price) else {
+        return Ok(None);
+    };
 
-    Ok(PriceEvent::Tick(PriceTick::new(
+    Ok(Some(PriceEvent::Tick(PriceTick::new(
         InstrumentName::new(symbol),
         price,
         UnixMillis::new(time_micros / 1000),
-    )))
+    ))))
 }
 
 fn ticker_symbol(value: &Value) -> Option<&str> {
@@ -261,38 +268,44 @@ fn compact_ticker_price(value: &Value) -> Option<f64> {
     .or_else(|| parse_json_number(value.get("m").or_else(|| value.get("mark_price"))))
 }
 
-fn parse_trade_tick(value: &Value) -> Result<PriceEvent, FeedError> {
+fn parse_trade_tick(value: &Value) -> Result<Option<PriceEvent>, FeedError> {
     let symbol = value
         .get("sy")
         .or_else(|| value.get("symbol"))
         .and_then(Value::as_str)
         .ok_or_else(|| FeedError::Parse(format!("Delta trade missing symbol: {value}")))?;
-    let price = parse_json_number(value.get("p").or_else(|| value.get("price")))
-        .ok_or_else(|| FeedError::Parse(format!("Delta trade missing price: {value}")))?;
+    let Some(price) = parse_json_number(value.get("p").or_else(|| value.get("price"))) else {
+        log_ignored_delta_price("trade", symbol, None, "missing price");
+        return Ok(None);
+    };
     let time_micros = value
         .get("t")
         .or_else(|| value.get("timestamp"))
         .and_then(Value::as_u64)
         .ok_or_else(|| FeedError::Parse(format!("Delta trade missing timestamp: {value}")))?;
 
-    let price = Price::new(price).map_err(|error| FeedError::Parse(error.to_string()))?;
+    let Some(price) = valid_delta_price("trade", symbol, price) else {
+        return Ok(None);
+    };
 
-    Ok(PriceEvent::Tick(PriceTick::new(
+    Ok(Some(PriceEvent::Tick(PriceTick::new(
         InstrumentName::new(symbol),
         price,
         UnixMillis::new(time_micros / 1000),
-    )))
+    ))))
 }
 
-fn parse_spot_price_tick(value: &Value) -> Result<PriceEvent, FeedError> {
+fn parse_spot_price_tick(value: &Value) -> Result<Option<PriceEvent>, FeedError> {
     let symbol = value
         .get("s")
         .or_else(|| value.get("sy"))
         .or_else(|| value.get("symbol"))
         .and_then(Value::as_str)
         .ok_or_else(|| FeedError::Parse(format!("Delta spot price missing symbol: {value}")))?;
-    let price = parse_json_number(value.get("p").or_else(|| value.get("price")))
-        .ok_or_else(|| FeedError::Parse(format!("Delta spot price missing price: {value}")))?;
+    let Some(price) = parse_json_number(value.get("p").or_else(|| value.get("price"))) else {
+        log_ignored_delta_price("spot_price", symbol, None, "missing price");
+        return Ok(None);
+    };
     let time_micros = value
         .get("t")
         .or_else(|| value.get("timestamp"))
@@ -300,13 +313,45 @@ fn parse_spot_price_tick(value: &Value) -> Result<PriceEvent, FeedError> {
         .and_then(Value::as_u64)
         .unwrap_or_else(current_unix_micros);
 
-    let price = Price::new(price).map_err(|error| FeedError::Parse(error.to_string()))?;
+    let Some(price) = valid_delta_price("spot_price", symbol, price) else {
+        return Ok(None);
+    };
 
-    Ok(PriceEvent::Tick(PriceTick::new(
+    Ok(Some(PriceEvent::Tick(PriceTick::new(
         InstrumentName::new(symbol),
         price,
         UnixMillis::new(time_micros / 1000),
-    )))
+    ))))
+}
+
+fn valid_delta_price(message_type: &str, symbol: &str, price: f64) -> Option<Price> {
+    match Price::new(price) {
+        Ok(price) => Some(price),
+        Err(reason) => {
+            log_ignored_delta_price(message_type, symbol, Some(price), reason);
+            None
+        }
+    }
+}
+
+fn log_ignored_delta_price(message_type: &str, symbol: &str, price: Option<f64>, reason: &str) {
+    let count = INVALID_DELTA_PRICE_LOGS.fetch_add(1, Ordering::Relaxed);
+    if count >= MAX_INVALID_DELTA_PRICE_LOGS {
+        return;
+    }
+
+    match price {
+        Some(price) => eprintln!(
+            "Delta ignored invalid {message_type} price: symbol={symbol} price={price} reason={reason}"
+        ),
+        None => {
+            eprintln!("Delta ignored invalid {message_type} price: symbol={symbol} reason={reason}")
+        }
+    }
+
+    if count + 1 == MAX_INVALID_DELTA_PRICE_LOGS {
+        eprintln!("Delta invalid price log limit reached; suppressing further invalid price logs");
+    }
 }
 
 fn parse_json_number(value: Option<&Value>) -> Option<f64> {
@@ -437,5 +482,23 @@ mod tests {
         assert!(matches!(event, PriceEvent::Tick(_)));
         assert_eq!(event.instrument_name(), &InstrumentName::new(".DEXBTUSD"));
         assert_eq!(event.price().as_f64(), 72_612.42);
+    }
+
+    #[test]
+    fn ignores_invalid_delta_price_without_failing_feed() {
+        let invalid_price = r#"{
+            "close": 0,
+            "symbol": "BTCUSD",
+            "timestamp": 1775800366578410,
+            "type": "v2/ticker"
+        }"#;
+        let missing_price = r#"{
+            "symbol": "BTCUSD",
+            "timestamp": 1775800366578410,
+            "type": "v2/ticker"
+        }"#;
+
+        assert_eq!(parse_delta_text_message(invalid_price).unwrap(), None);
+        assert_eq!(parse_delta_text_message(missing_price).unwrap(), None);
     }
 }
