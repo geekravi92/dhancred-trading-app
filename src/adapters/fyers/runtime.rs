@@ -14,6 +14,7 @@ use crate::feeder::{
     FeedError, InstrumentCatalog, InstrumentDefinition, InstrumentType, PriceEvent,
     RefreshDecision, SubscriptionDiff, UniverseRefreshState,
 };
+use crate::notification::notify_recovery;
 
 pub fn run_live(config: &FyersBrokerSection, max_events: usize) -> Result<(), FeedError> {
     if !config.enabled {
@@ -71,6 +72,11 @@ pub fn run_live(config: &FyersBrokerSection, max_events: usize) -> Result<(), Fe
         .map(|reference| reference.instrument.clone())
         .collect::<Vec<_>>();
     live_feeder.subscribe_instruments(&spot_instruments)?;
+    notify_recovery(
+        "broker:FYERS",
+        "FYERS",
+        "feed connected and spot subscriptions restored",
+    );
     if log_to_console {
         println!("Waiting for first live spot ticks from FYERS SymbolUpdate");
     }

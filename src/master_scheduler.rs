@@ -5,6 +5,7 @@ use crate::adapters::delta::product_master::{DeltaProductClient, ensure_delta_ma
 use crate::adapters::fyers::master as fyers_master;
 use crate::config::{AppConfig, BrokersSection};
 use crate::feeder::FeedError;
+use crate::notification::{AlertSeverity, notify_failure, notify_recovery};
 
 // IST is a fixed UTC+05:30 offset and has no daylight-saving shift, so this
 // scheduler does not need a timezone database just to run at 08:00 IST.
@@ -67,6 +68,18 @@ fn run_master_refresh_job(broker_configs: &BrokersSection, brokers: &[String]) {
     for broker in brokers {
         if let Err(error) = refresh_broker_master(broker_configs, broker) {
             eprintln!("Master scheduler {broker} refresh failed: {error}");
+            notify_failure(
+                format!("master_scheduler:{broker}"),
+                format!("MASTER_SCHEDULER:{broker}"),
+                AlertSeverity::Error,
+                format!("master refresh failed: {error}"),
+            );
+        } else {
+            notify_recovery(
+                format!("master_scheduler:{broker}"),
+                format!("MASTER_SCHEDULER:{broker}"),
+                "master refresh recovered",
+            );
         }
     }
     println!("Master scheduler refresh finished");

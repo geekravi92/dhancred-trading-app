@@ -12,6 +12,7 @@ use crate::feeder::{
     FeedError, InstrumentCatalog, InstrumentType, PriceEvent, RefreshDecision, SubscriptionDiff,
     UniverseRefreshState,
 };
+use crate::notification::notify_recovery;
 
 pub fn run_live(config: &DeltaBrokerSection, max_events: usize) -> Result<(), FeedError> {
     let log_to_console = config.console_logging.unwrap_or(true);
@@ -40,6 +41,11 @@ pub fn run_live(config: &DeltaBrokerSection, max_events: usize) -> Result<(), Fe
         );
     }
     live_feeder.subscribe_spot_symbols(&spot_symbols)?;
+    notify_recovery(
+        "broker:DELTA",
+        "DELTA",
+        "feed connected and spot subscriptions restored",
+    );
     if log_to_console {
         println!("Waiting for first live spot ticks from Delta spot_price");
         println!();

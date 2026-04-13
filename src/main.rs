@@ -5,10 +5,28 @@ use dhancred_trading_app::admin::start_admin_server;
 use dhancred_trading_app::config::AppConfig;
 use dhancred_trading_app::feeder::FeedError;
 use dhancred_trading_app::master_scheduler::start_master_scheduler;
+use dhancred_trading_app::notification::{
+    AlertSeverity, init_notification_service, notify_failure,
+};
 
 fn main() -> Result<(), FeedError> {
     dotenvy::dotenv().ok();
+    init_notification_service();
 
+    let result = run();
+    if let Err(error) = &result {
+        notify_failure(
+            "app.main",
+            "APP",
+            AlertSeverity::Critical,
+            format!("fatal application error: {error}"),
+        );
+    }
+
+    result
+}
+
+fn run() -> Result<(), FeedError> {
     let config_path =
         env::var("FEEDER_CONFIG_PATH").unwrap_or_else(|_| "config/feeder.toml".to_string());
     let config = AppConfig::load(&config_path)?;
