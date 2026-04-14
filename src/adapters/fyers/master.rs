@@ -353,19 +353,6 @@ pub fn write_fyers_derivatives_csv(
     Ok(())
 }
 
-pub fn print_fyers_universe_summary(summary: &FyersUniverseSummary) {
-    println!("FYERS symbol master loaded");
-    println!(
-        "Underlying: {} | reference: {} @ {:.4}",
-        summary.selected_underlying, summary.reference_symbol, summary.reference_price
-    );
-    println!(
-        "Selected instruments: futures={} options={}",
-        summary.futures.len(),
-        summary.atm_options.len()
-    );
-}
-
 fn read_matching_fyers_master_instruments(
     master_data_dir: impl AsRef<Path>,
     selection: &InstrumentSelection,

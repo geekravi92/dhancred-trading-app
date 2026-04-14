@@ -9,6 +9,7 @@ use serde_json::Value;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket, connect};
 
+use crate::adapters::fyers::token::jwt_access_token_only;
 use crate::feeder::{
     FeedError, InstrumentDefinition, InstrumentName, Price, PriceEvent, PriceTick, UnixMillis,
 };
@@ -45,7 +46,7 @@ impl FyersLiveFeeder {
         log_control_messages: bool,
     ) -> Result<Self, FeedError> {
         let token_input = access_token.trim();
-        let access_token = fyers_data_access_token(token_input)?;
+        let access_token = jwt_access_token_only(token_input)?.to_string();
         let hsm_key = decode_hsm_key(&access_token)?;
         let (mut socket, _response) = connect(ws_url)?;
 
@@ -429,19 +430,6 @@ fn log_ignored_fyers_price(symbol: &str, price: f64, reason: &str) {
     }
 }
 
-fn fyers_data_access_token(access_token: &str) -> Result<String, FeedError> {
-    Ok(jwt_access_token_only(access_token)?.to_string())
-}
-
-fn strip_bearer_prefix(value: &str) -> &str {
-    value
-        .trim()
-        .strip_prefix("Bearer ")
-        .or_else(|| value.trim().strip_prefix("bearer "))
-        .unwrap_or_else(|| value.trim())
-        .trim()
-}
-
 fn control_response_status(data: &[u8]) -> Result<String, FeedError> {
     if data.len() < 8 {
         return Err(FeedError::Parse(
@@ -468,21 +456,6 @@ fn control_response_status(data: &[u8]) -> Result<String, FeedError> {
     Err(FeedError::Parse(
         "FYERS control response status missing".to_string(),
     ))
-}
-
-fn jwt_access_token_only(access_token: &str) -> Result<&str, FeedError> {
-    let stripped = strip_bearer_prefix(access_token);
-    let token = stripped
-        .rsplit_once(':')
-        .map(|(_, token)| token)
-        .unwrap_or(stripped)
-        .trim();
-    if token.is_empty() {
-        return Err(FeedError::Config(
-            "FYERS access token cannot be empty".to_string(),
-        ));
-    }
-    Ok(token)
 }
 
 fn decode_hsm_key(access_token: &str) -> Result<String, FeedError> {
@@ -715,11 +688,11 @@ mod tests {
     #[test]
     fn fyers_data_socket_uses_raw_jwt_even_when_app_id_prefix_is_present() {
         assert_eq!(
-            fyers_data_access_token("APPID:header.payload.signature").unwrap(),
+            jwt_access_token_only("APPID:header.payload.signature").unwrap(),
             "header.payload.signature"
         );
         assert_eq!(
-            fyers_data_access_token("Bearer header.payload.signature").unwrap(),
+            jwt_access_token_only("Bearer header.payload.signature").unwrap(),
             "header.payload.signature"
         );
     }

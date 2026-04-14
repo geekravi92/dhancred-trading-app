@@ -25,8 +25,13 @@ pub fn run_feed_brokers(config: &AppConfig, max_events: usize) -> Result<(), Fee
                     })?;
 
                 if delta_config.enabled {
+                    let historical_candles = config.historical_candles.clone();
                     spawn_broker(&mut handles, "DELTA", move || {
-                        delta::runtime::run_live(&delta_config, max_events)
+                        delta::runtime::run_live(
+                            &delta_config,
+                            historical_candles.as_ref(),
+                            max_events,
+                        )
                     });
                 }
             }
@@ -37,8 +42,9 @@ pub fn run_feed_brokers(config: &AppConfig, max_events: usize) -> Result<(), Fee
                     })?;
 
                 if fyers_config.enabled {
+                    let historical_candles = config.historical_candles.clone();
                     spawn_broker(&mut handles, "FYERS", move || {
-                        fyers::run_live(&fyers_config, max_events)
+                        fyers::run_live(&fyers_config, historical_candles.as_ref(), max_events)
                     });
                 }
             }
@@ -106,7 +112,17 @@ where
 fn broker_restart_delay_secs(error: &FeedError) -> u64 {
     match error {
         FeedError::Config(_) => CONFIG_RESTART_DELAY_SECS,
-        FeedError::Http(_) | FeedError::Disconnected(_) => TRANSIENT_RESTART_DELAY_SECS,
+        FeedError::Http(value) => {
+            if value.contains("status=401")
+                || value.contains("status=403")
+                || value.contains("status=429")
+            {
+                CONFIG_RESTART_DELAY_SECS
+            } else {
+                TRANSIENT_RESTART_DELAY_SECS
+            }
+        }
+        FeedError::Disconnected(_) => TRANSIENT_RESTART_DELAY_SECS,
         FeedError::Io(_) | FeedError::Parse(_) | FeedError::InvalidInstrument(_) => {
             TRANSIENT_RESTART_DELAY_SECS
         }
@@ -159,5 +175,21 @@ mod tests {
     fn preserves_transient_error_kind_when_annotating_broker_failures() {
         let error = annotate_broker_error("DELTA", FeedError::Disconnected("socket closed".into()));
         assert!(matches!(error, FeedError::Disconnected(_)));
+    }
+
+    #[test]
+    fn auth_http_errors_back_off_like_config_errors() {
+        assert_eq!(
+            broker_restart_delay_secs(&FeedError::Http("status=401".to_string())),
+            CONFIG_RESTART_DELAY_SECS
+        );
+        assert_eq!(
+            broker_restart_delay_secs(&FeedError::Http("status=403".to_string())),
+            CONFIG_RESTART_DELAY_SECS
+        );
+        assert_eq!(
+            broker_restart_delay_secs(&FeedError::Http("status=429".to_string())),
+            CONFIG_RESTART_DELAY_SECS
+        );
     }
 }

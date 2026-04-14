@@ -1,6 +1,7 @@
 pub mod catalog;
 pub mod error;
 pub mod event;
+pub mod historical_candles;
 pub mod universe;
 
 pub use catalog::{

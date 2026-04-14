@@ -1,26 +1,47 @@
 use std::collections::BTreeMap;
 
+use crate::adapters::delta::historical::DeltaHistoricalClient;
 use crate::adapters::delta::latest_price_file::DeltaLatestPriceFile;
 use crate::adapters::delta::live::DeltaLiveFeeder;
 use crate::adapters::delta::product_master::{
     DeltaProductClient, DeltaSpotReference, DeltaUniverseSummary,
     build_delta_universe_summary_from_master_csv, ensure_delta_master_csv_with_logging,
-    print_delta_universe_summary, selected_trading_symbols, write_delta_derivatives_csv,
+    selected_trading_symbols, write_delta_derivatives_csv,
 };
-use crate::config::{DeltaBrokerSection, InstrumentSelection};
+use crate::adapters::historical::{recover_spot_history, start_spot_history_maintenance};
+use crate::config::{DeltaBrokerSection, HistoricalCandlesSection, InstrumentSelection};
 use crate::feeder::{
     FeedError, InstrumentCatalog, InstrumentType, PriceEvent, RefreshDecision, SubscriptionDiff,
-    UniverseRefreshState,
+    UniverseRefreshState, historical_candles::HistoricalCandleService,
 };
 use crate::notification::notify_recovery;
 
-pub fn run_live(config: &DeltaBrokerSection, max_events: usize) -> Result<(), FeedError> {
+pub fn run_live(
+    config: &DeltaBrokerSection,
+    historical_candles_config: Option<&HistoricalCandlesSection>,
+    max_events: usize,
+) -> Result<(), FeedError> {
     let log_to_console = config.console_logging.unwrap_or(true);
     let base_catalog = InstrumentCatalog::load_csv(&config.base_instruments_csv)?;
     let spot_references = spot_references_from_base_catalog(&base_catalog)?;
     let selection = InstrumentSelection::from(config);
     let delta = DeltaProductClient::new(config.rest_url()?);
+    let delta_historical = DeltaHistoricalClient::new(config.rest_url()?);
     ensure_delta_master_csv_with_logging(&delta, &config.master_csv, log_to_console)?;
+    recover_spot_history(
+        &delta_historical,
+        historical_candles_config,
+        &base_catalog,
+        log_to_console,
+    )?;
+    let _historical_maintenance = start_spot_history_maintenance(
+        delta_historical,
+        historical_candles_config,
+        &base_catalog,
+        log_to_console,
+    )?;
+    let mut historical_candles =
+        HistoricalCandleService::new(historical_candles_config, &base_catalog)?;
     let mut live_feeder =
         DeltaLiveFeeder::connect(&config.public_ws_url()?, config.ticker_channel.as_deref())?;
 
@@ -57,6 +78,7 @@ pub fn run_live(config: &DeltaBrokerSection, max_events: usize) -> Result<(), Fe
         &spot_to_underlying,
         &mut active_summaries,
         &mut latest_prices,
+        &mut historical_candles,
         config,
         &selection,
         log_to_console,
@@ -69,6 +91,7 @@ pub fn run_live(config: &DeltaBrokerSection, max_events: usize) -> Result<(), Fe
         &spot_to_underlying,
         &mut active_summaries,
         &mut latest_prices,
+        &mut historical_candles,
         config,
         &selection,
         max_events,
@@ -158,6 +181,7 @@ fn wait_for_all_spot_anchors(
     spot_to_underlying: &BTreeMap<String, String>,
     active_summaries: &mut BTreeMap<String, DeltaUniverseSummary>,
     latest_prices: &mut Option<DeltaLatestPriceFile>,
+    historical_candles: &mut HistoricalCandleService,
     config: &DeltaBrokerSection,
     selection: &InstrumentSelection,
     log_to_console: bool,
@@ -170,6 +194,8 @@ fn wait_for_all_spot_anchors(
         let PriceEvent::Tick(tick) = event else {
             continue;
         };
+
+        historical_candles.on_tick(&tick)?;
 
         if let Some(latest_prices) = latest_prices.as_mut() {
             latest_prices.update_tick(&tick.instrument_name, tick.price.as_f64())?;
@@ -211,6 +237,7 @@ fn stream_live_ticks(
     spot_to_underlying: &BTreeMap<String, String>,
     active_summaries: &mut BTreeMap<String, DeltaUniverseSummary>,
     latest_prices: &mut Option<DeltaLatestPriceFile>,
+    historical_candles: &mut HistoricalCandleService,
     config: &DeltaBrokerSection,
     selection: &InstrumentSelection,
     max_events: usize,
@@ -225,6 +252,8 @@ fn stream_live_ticks(
         let PriceEvent::Tick(tick) = event else {
             continue;
         };
+
+        historical_candles.on_tick(&tick)?;
 
         if let Some(latest_prices) = latest_prices.as_mut() {
             latest_prices.update_tick(&tick.instrument_name, tick.price.as_f64())?;
@@ -364,12 +393,6 @@ fn refresh_delta_universe(
             diff.subscribe.len(),
             diff.unsubscribe.len()
         );
-        println!();
-
-        if let Some(summary) = active_summaries.get(underlying) {
-            print_delta_universe_summary(summary);
-            println!();
-        }
     }
 
     Ok(())

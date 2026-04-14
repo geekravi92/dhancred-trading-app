@@ -1,22 +1,28 @@
 use std::collections::BTreeMap;
 use std::fs;
 
+use crate::adapters::fyers::historical::FyersHistoricalClient;
 use crate::adapters::fyers::latest_price_file::FyersLatestPriceFile;
 use crate::adapters::fyers::live::FyersLiveFeeder;
 use crate::adapters::fyers::master::{
     FyersUniverseSummary, build_fyers_universe_summary_from_master_csvs,
-    print_fyers_universe_summary, refresh_all, selected_trading_symbols,
-    write_fyers_derivatives_csv,
+    refresh_all, selected_trading_symbols, write_fyers_derivatives_csv,
 };
 use crate::adapters::fyers::session;
-use crate::config::{FyersBrokerSection, InstrumentSelection};
+use crate::adapters::historical::{recover_spot_history, start_spot_history_maintenance};
+use crate::config::{FyersBrokerSection, HistoricalCandlesSection, InstrumentSelection};
 use crate::feeder::{
     FeedError, InstrumentCatalog, InstrumentDefinition, InstrumentType, PriceEvent,
     RefreshDecision, SubscriptionDiff, UniverseRefreshState,
+    historical_candles::HistoricalCandleService,
 };
 use crate::notification::notify_recovery;
 
-pub fn run_live(config: &FyersBrokerSection, max_events: usize) -> Result<(), FeedError> {
+pub fn run_live(
+    config: &FyersBrokerSection,
+    historical_candles_config: Option<&HistoricalCandlesSection>,
+    max_events: usize,
+) -> Result<(), FeedError> {
     if !config.enabled {
         return Ok(());
     }
@@ -40,14 +46,28 @@ pub fn run_live(config: &FyersBrokerSection, max_events: usize) -> Result<(), Fe
         }
     }
 
-    session::wait_for_market_session(config.market_sessions.as_deref())?;
-
     let base_catalog = InstrumentCatalog::load_csv(&config.base_instruments_csv)?;
     let spot_references = spot_references_from_base_catalog(&base_catalog)?;
     let selection = InstrumentSelection::from(config);
     let access_token = fs::read_to_string(&config.access_token_file).map_err(|error| {
         FeedError::Config(format!("failed to read FYERS access token: {error}"))
     })?;
+    let fyers_historical = FyersHistoricalClient::new(config, access_token.trim())?;
+    recover_spot_history(
+        &fyers_historical,
+        historical_candles_config,
+        &base_catalog,
+        log_to_console,
+    )?;
+    let _historical_maintenance = start_spot_history_maintenance(
+        fyers_historical,
+        historical_candles_config,
+        &base_catalog,
+        log_to_console,
+    )?;
+    let mut historical_candles =
+        HistoricalCandleService::new(historical_candles_config, &base_catalog)?;
+    session::wait_for_market_session(config.market_sessions.as_deref())?;
     let mut live_feeder =
         FyersLiveFeeder::connect(&config.data_ws_url, access_token.trim(), log_to_console)?;
 
@@ -87,6 +107,7 @@ pub fn run_live(config: &FyersBrokerSection, max_events: usize) -> Result<(), Fe
         &spot_to_underlying,
         &mut active_summaries,
         &mut latest_prices,
+        &mut historical_candles,
         config,
         &selection,
         log_to_console,
@@ -99,6 +120,7 @@ pub fn run_live(config: &FyersBrokerSection, max_events: usize) -> Result<(), Fe
         &spot_to_underlying,
         &mut active_summaries,
         &mut latest_prices,
+        &mut historical_candles,
         config,
         &selection,
         max_events,
@@ -189,6 +211,7 @@ fn wait_for_all_spot_anchors(
     spot_to_underlying: &BTreeMap<String, String>,
     active_summaries: &mut BTreeMap<String, FyersUniverseSummary>,
     latest_prices: &mut Option<FyersLatestPriceFile>,
+    historical_candles: &mut HistoricalCandleService,
     config: &FyersBrokerSection,
     selection: &InstrumentSelection,
     log_to_console: bool,
@@ -201,6 +224,8 @@ fn wait_for_all_spot_anchors(
         let PriceEvent::Tick(tick) = event else {
             continue;
         };
+
+        historical_candles.on_tick(&tick)?;
 
         if let Some(latest_prices) = latest_prices.as_mut() {
             latest_prices.update_tick(&tick.instrument_name, tick.price.as_f64())?;
@@ -242,6 +267,7 @@ fn stream_live_ticks(
     spot_to_underlying: &BTreeMap<String, String>,
     active_summaries: &mut BTreeMap<String, FyersUniverseSummary>,
     latest_prices: &mut Option<FyersLatestPriceFile>,
+    historical_candles: &mut HistoricalCandleService,
     config: &FyersBrokerSection,
     selection: &InstrumentSelection,
     max_events: usize,
@@ -256,6 +282,8 @@ fn stream_live_ticks(
         let PriceEvent::Tick(tick) = event else {
             continue;
         };
+
+        historical_candles.on_tick(&tick)?;
 
         if let Some(latest_prices) = latest_prices.as_mut() {
             latest_prices.update_tick(&tick.instrument_name, tick.price.as_f64())?;
@@ -393,9 +421,6 @@ fn refresh_fyers_universe(
             diff.subscribe.len(),
             diff.unsubscribe.len()
         );
-        if let Some(summary) = active_summaries.get(underlying) {
-            print_fyers_universe_summary(summary);
-        }
     }
 
     Ok(())

@@ -11,6 +11,7 @@ use crate::feeder::FeedError;
 pub struct AppConfig {
     pub feeder: FeederSection,
     pub brokers: BrokersSection,
+    pub historical_candles: Option<HistoricalCandlesSection>,
     pub admin: Option<AdminSection>,
     pub master_scheduler: Option<MasterSchedulerSection>,
     pub channels: ChannelsSection,
@@ -78,6 +79,7 @@ pub struct FyersBrokerSection {
     pub refresh_trigger_pct: f64,
     pub data_ws_url: String,
     pub access_token_file: String,
+    pub app_id_env: Option<String>,
     pub latest_prices_file: Option<String>,
     pub console_logging: Option<bool>,
     pub market_sessions: Option<Vec<FyersMarketSessionSection>>,
@@ -98,6 +100,22 @@ pub struct FyersMarketSessionSection {
 pub struct ChannelsSection {
     pub price_tick: bool,
     pub price_candles: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct HistoricalCandlesSection {
+    pub enabled: bool,
+    pub sqlite_path: String,
+    #[serde(default = "default_historical_one_minute_days")]
+    pub one_minute_days: u32,
+    #[serde(default = "default_historical_one_day_days")]
+    pub one_day_days: u32,
+    #[serde(default = "default_historical_maintenance_time_ist")]
+    pub maintenance_time_ist: String,
+    #[serde(default = "default_historical_reconcile_one_minute_days")]
+    pub reconcile_one_minute_days: u32,
+    #[serde(default = "default_historical_reconcile_one_day_days")]
+    pub reconcile_one_day_days: u32,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -148,4 +166,24 @@ impl From<&FyersBrokerSection> for InstrumentSelection {
 
 fn env_from_name(name: &str) -> Result<String, FeedError> {
     env::var(name).map_err(|_| FeedError::Config(format!("missing environment variable {name}")))
+}
+
+fn default_historical_one_minute_days() -> u32 {
+    90
+}
+
+fn default_historical_one_day_days() -> u32 {
+    300
+}
+
+fn default_historical_maintenance_time_ist() -> String {
+    "00:10".to_string()
+}
+
+fn default_historical_reconcile_one_minute_days() -> u32 {
+    2
+}
+
+fn default_historical_reconcile_one_day_days() -> u32 {
+    5
 }
