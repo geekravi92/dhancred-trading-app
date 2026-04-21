@@ -12,6 +12,7 @@ pub struct AppConfig {
     pub feeder: FeederSection,
     pub brokers: BrokersSection,
     pub historical_candles: Option<HistoricalCandlesSection>,
+    pub strategy: Option<StrategySection>,
     pub admin: Option<AdminSection>,
     pub master_scheduler: Option<MasterSchedulerSection>,
     pub channels: ChannelsSection,
@@ -119,6 +120,16 @@ pub struct HistoricalCandlesSection {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+pub struct StrategySection {
+    pub enabled: bool,
+    pub sqlite_path: String,
+    #[serde(default = "default_strategy_warmup_bars")]
+    pub warmup_bars: usize,
+    #[serde(default = "default_strategy_recent_bars")]
+    pub recent_bars: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct AdminSection {
     pub enabled: bool,
     pub bind_addr: String,
@@ -186,4 +197,12 @@ fn default_historical_reconcile_one_minute_days() -> u32 {
 
 fn default_historical_reconcile_one_day_days() -> u32 {
     5
+}
+
+fn default_strategy_warmup_bars() -> usize {
+    512
+}
+
+fn default_strategy_recent_bars() -> usize {
+    512
 }

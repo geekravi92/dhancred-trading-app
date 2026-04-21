@@ -4,4 +4,5 @@ pub mod config;
 pub mod feeder;
 pub mod master_scheduler;
 pub mod notification;
+pub mod strategy;
 pub mod storage;

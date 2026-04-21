@@ -5,7 +5,7 @@ use std::time::Duration;
 use chrono::{FixedOffset, NaiveDateTime};
 use rusqlite::{Connection, params};
 
-use crate::feeder::{Candle, FeedError, InstrumentName, Timeframe, UnixMillis};
+use crate::feeder::{Candle, FeedError, InstrumentName, Price, Timeframe, UnixMillis};
 
 const IST_OFFSET_SECONDS: i32 = 5 * 60 * 60 + 30 * 60;
 
@@ -170,6 +170,97 @@ impl HistoricalCandleStore {
                 ))
             })
     }
+
+    pub fn load_recent_candles(
+        &self,
+        instrument_name: &InstrumentName,
+        timeframe: Timeframe,
+        limit: usize,
+    ) -> Result<Vec<Candle>, FeedError> {
+        let timeframe = timeframe_label(timeframe);
+        let mut statement = self
+            .connection
+            .prepare(
+                "\
+                SELECT date, start_time, end_time, open, high, low, close, volume
+                FROM historical_candles
+                WHERE instrument_name = ?1 AND timeframe = ?2
+                ORDER BY date DESC, start_time DESC
+                LIMIT ?3
+                ",
+            )
+            .map_err(|error| {
+                FeedError::Io(format!(
+                    "failed to prepare recent historical candles query for {} {}: {error}",
+                    instrument_name, timeframe
+                ))
+            })?;
+        let rows = statement
+            .query_map(params![instrument_name.as_str(), timeframe, limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, f64>(4)?,
+                    row.get::<_, f64>(5)?,
+                    row.get::<_, f64>(6)?,
+                    row.get::<_, f64>(7)?,
+                ))
+            })
+            .map_err(|error| {
+                FeedError::Io(format!(
+                    "failed to query recent historical candles for {} {}: {error}",
+                    instrument_name, timeframe
+                ))
+            })?;
+
+        let mut candles = Vec::new();
+        for row in rows {
+            let (date, start_time, end_time, open, high, low, close, volume) =
+                row.map_err(|error| {
+                    FeedError::Io(format!(
+                        "failed to read recent historical candles for {} {}: {error}",
+                        instrument_name, timeframe
+                    ))
+                })?;
+            let start_at = parse_ist_date_and_time_to_unix_millis(&date, &start_time)?;
+            let end_at = parse_ist_date_and_time_to_unix_millis(&date, &end_time)?;
+            candles.push(Candle::new(
+                instrument_name.clone(),
+                parse_timeframe_label(timeframe)?,
+                UnixMillis::new(start_at),
+                UnixMillis::new(end_at),
+                Price::new(open).map_err(|error| {
+                    FeedError::Parse(format!(
+                        "invalid open price for {} {} {} {}: {error}",
+                        instrument_name, timeframe, date, start_time
+                    ))
+                })?,
+                Price::new(high).map_err(|error| {
+                    FeedError::Parse(format!(
+                        "invalid high price for {} {} {} {}: {error}",
+                        instrument_name, timeframe, date, start_time
+                    ))
+                })?,
+                Price::new(low).map_err(|error| {
+                    FeedError::Parse(format!(
+                        "invalid low price for {} {} {} {}: {error}",
+                        instrument_name, timeframe, date, start_time
+                    ))
+                })?,
+                Price::new(close).map_err(|error| {
+                    FeedError::Parse(format!(
+                        "invalid close price for {} {} {} {}: {error}",
+                        instrument_name, timeframe, date, start_time
+                    ))
+                })?,
+                volume,
+            ));
+        }
+        candles.reverse();
+        Ok(candles)
+    }
 }
 
 pub fn timeframe_label(timeframe: Timeframe) -> &'static str {
@@ -180,6 +271,18 @@ pub fn timeframe_label(timeframe: Timeframe) -> &'static str {
         Timeframe::FifteenMinute => "15m",
         Timeframe::OneHour => "1h",
         Timeframe::OneDay => "1d",
+    }
+}
+
+fn parse_timeframe_label(value: &str) -> Result<Timeframe, FeedError> {
+    match value {
+        "1m" => Ok(Timeframe::OneMinute),
+        "3m" => Ok(Timeframe::ThreeMinute),
+        "5m" => Ok(Timeframe::FiveMinute),
+        "15m" => Ok(Timeframe::FifteenMinute),
+        "1h" => Ok(Timeframe::OneHour),
+        "1d" => Ok(Timeframe::OneDay),
+        _ => Err(FeedError::Parse(format!("unsupported timeframe label {value}"))),
     }
 }
 

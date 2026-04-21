@@ -1,4 +1,5 @@
 use std::env;
+use std::io::ErrorKind;
 
 use dhancred_trading_app::adapters::run_feed_brokers;
 use dhancred_trading_app::admin::start_admin_server;
@@ -8,9 +9,10 @@ use dhancred_trading_app::master_scheduler::start_master_scheduler;
 use dhancred_trading_app::notification::{
     AlertSeverity, init_notification_service, notify_failure,
 };
+use dhancred_trading_app::strategy::start_strategy_runtime;
 
 fn main() -> Result<(), FeedError> {
-    dotenvy::dotenv().ok();
+    load_dotenv()?;
     init_notification_service();
 
     let result = run();
@@ -26,6 +28,14 @@ fn main() -> Result<(), FeedError> {
     result
 }
 
+fn load_dotenv() -> Result<(), FeedError> {
+    match dotenvy::from_path(".env") {
+        Ok(_) => Ok(()),
+        Err(dotenvy::Error::Io(error)) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(FeedError::Config(format!("failed to load .env: {error}"))),
+    }
+}
+
 fn run() -> Result<(), FeedError> {
     let config_path =
         env::var("FEEDER_CONFIG_PATH").unwrap_or_else(|_| "config/feeder.toml".to_string());
@@ -38,10 +48,11 @@ fn run() -> Result<(), FeedError> {
         )));
     }
 
-    let _admin_server = start_admin_server(&config)?;
+    let strategy_runtime = start_strategy_runtime(&config)?;
+    let _admin_server = start_admin_server(&config, strategy_runtime.clone())?;
     let _master_scheduler = start_master_scheduler(&config)?;
 
-    run_feed_brokers(&config, configured_max_events(&config)?)
+    run_feed_brokers(&config, strategy_runtime, configured_max_events(&config)?)
 }
 
 fn configured_max_events(config: &AppConfig) -> Result<usize, FeedError> {

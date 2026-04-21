@@ -1,21 +1,27 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::adapters::fyers::token::write_access_token;
 use crate::config::AppConfig;
 use crate::feeder::FeedError;
+use crate::strategy::StrategyRuntimeHandle;
 
 const FYERS_ACCESS_TOKEN_PATH: &str = "/admin/fyers/access-token";
+const STRATEGY_RELOAD_PATH: &str = "/admin/strategy/reload";
 const MAX_REQUEST_BYTES: usize = 16 * 1024;
 
 pub struct AdminServerHandle {
     _handle: JoinHandle<()>,
 }
 
-pub fn start_admin_server(config: &AppConfig) -> Result<Option<AdminServerHandle>, FeedError> {
+pub fn start_admin_server(
+    config: &AppConfig,
+    strategy_runtime: Option<Arc<StrategyRuntimeHandle>>,
+) -> Result<Option<AdminServerHandle>, FeedError> {
     let Some(admin_config) = &config.admin else {
         return Ok(None);
     };
@@ -47,7 +53,9 @@ pub fn start_admin_server(config: &AppConfig) -> Result<Option<AdminServerHandle
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    if let Err(error) = handle_connection(stream, &access_token_file) {
+                    if let Err(error) =
+                        handle_connection(stream, &access_token_file, strategy_runtime.as_ref())
+                    {
                         eprintln!("admin API request failed: {error}");
                     }
                 }
@@ -59,7 +67,11 @@ pub fn start_admin_server(config: &AppConfig) -> Result<Option<AdminServerHandle
     Ok(Some(AdminServerHandle { _handle: handle }))
 }
 
-fn handle_connection(mut stream: TcpStream, access_token_file: &str) -> Result<(), FeedError> {
+fn handle_connection(
+    mut stream: TcpStream,
+    access_token_file: &str,
+    strategy_runtime: Option<&Arc<StrategyRuntimeHandle>>,
+) -> Result<(), FeedError> {
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     let request = read_http_request(&mut stream)?;
 
@@ -68,6 +80,13 @@ fn handle_connection(mut stream: TcpStream, access_token_file: &str) -> Result<(
         ("POST", FYERS_ACCESS_TOKEN_PATH) => {
             write_access_token(access_token_file, &request.body)?;
             write_response(&mut stream, 200, "FYERS access token updated\n")
+        }
+        ("POST", STRATEGY_RELOAD_PATH) => {
+            let Some(strategy_runtime) = strategy_runtime else {
+                return write_response(&mut stream, 404, "strategy runtime disabled\n");
+            };
+            let count = strategy_runtime.reload_ssus()?;
+            write_response(&mut stream, 200, &format!("reloaded {count} active SSUs\n"))
         }
         _ => write_response(&mut stream, 404, "not found\n"),
     }

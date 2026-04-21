@@ -25,7 +25,7 @@ pub enum FeedChannel {
     PriceCandle(Timeframe),
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Timeframe {
     OneMinute,
     ThreeMinute,

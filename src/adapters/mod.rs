@@ -3,17 +3,23 @@ pub mod fyers;
 pub mod historical;
 
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use crate::config::AppConfig;
 use crate::feeder::FeedError;
 use crate::notification::{AlertSeverity, notify_failure};
+use crate::strategy::StrategyRuntimeHandle;
 
 const CONFIG_RESTART_DELAY_SECS: u64 = 60;
 const TRANSIENT_RESTART_DELAY_SECS: u64 = 10;
 
-pub fn run_feed_brokers(config: &AppConfig, max_events: usize) -> Result<(), FeedError> {
+pub fn run_feed_brokers(
+    config: &AppConfig,
+    strategy_runtime: Option<Arc<StrategyRuntimeHandle>>,
+    max_events: usize,
+) -> Result<(), FeedError> {
     let mut handles = Vec::new();
 
     for broker in &config.feeder.feed_brokers {
@@ -26,10 +32,12 @@ pub fn run_feed_brokers(config: &AppConfig, max_events: usize) -> Result<(), Fee
 
                 if delta_config.enabled {
                     let historical_candles = config.historical_candles.clone();
+                    let strategy_runtime = strategy_runtime.clone();
                     spawn_broker(&mut handles, "DELTA", move || {
                         delta::runtime::run_live(
                             &delta_config,
                             historical_candles.as_ref(),
+                            strategy_runtime.clone(),
                             max_events,
                         )
                     });
@@ -43,8 +51,14 @@ pub fn run_feed_brokers(config: &AppConfig, max_events: usize) -> Result<(), Fee
 
                 if fyers_config.enabled {
                     let historical_candles = config.historical_candles.clone();
+                    let strategy_runtime = strategy_runtime.clone();
                     spawn_broker(&mut handles, "FYERS", move || {
-                        fyers::run_live(&fyers_config, historical_candles.as_ref(), max_events)
+                        fyers::run_live(
+                            &fyers_config,
+                            historical_candles.as_ref(),
+                            strategy_runtime.clone(),
+                            max_events,
+                        )
                     });
                 }
             }

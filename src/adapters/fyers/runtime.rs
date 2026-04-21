@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::sync::Arc;
 
 use crate::adapters::fyers::historical::FyersHistoricalClient;
 use crate::adapters::fyers::latest_price_file::FyersLatestPriceFile;
@@ -17,10 +18,12 @@ use crate::feeder::{
     historical_candles::HistoricalCandleService,
 };
 use crate::notification::notify_recovery;
+use crate::strategy::StrategyRuntimeHandle;
 
 pub fn run_live(
     config: &FyersBrokerSection,
     historical_candles_config: Option<&HistoricalCandlesSection>,
+    strategy_runtime: Option<Arc<StrategyRuntimeHandle>>,
     max_events: usize,
 ) -> Result<(), FeedError> {
     if !config.enabled {
@@ -48,6 +51,7 @@ pub fn run_live(
 
     let base_catalog = InstrumentCatalog::load_csv(&config.base_instruments_csv)?;
     let spot_references = spot_references_from_base_catalog(&base_catalog)?;
+    let strategy_instrument_names = strategy_instrument_names(&base_catalog);
     let selection = InstrumentSelection::from(config);
     let access_token = fs::read_to_string(&config.access_token_file).map_err(|error| {
         FeedError::Config(format!("failed to read FYERS access token: {error}"))
@@ -108,6 +112,8 @@ pub fn run_live(
         &mut active_summaries,
         &mut latest_prices,
         &mut historical_candles,
+        strategy_runtime.as_ref(),
+        &strategy_instrument_names,
         config,
         &selection,
         log_to_console,
@@ -121,6 +127,8 @@ pub fn run_live(
         &mut active_summaries,
         &mut latest_prices,
         &mut historical_candles,
+        strategy_runtime.as_ref(),
+        &strategy_instrument_names,
         config,
         &selection,
         max_events,
@@ -162,6 +170,18 @@ fn spot_references_from_base_catalog(
     }
 
     Ok(references)
+}
+
+fn strategy_instrument_names(catalog: &InstrumentCatalog) -> BTreeMap<String, String> {
+    catalog
+        .instruments()
+        .map(|instrument| {
+            (
+                instrument.trading_symbol.clone(),
+                instrument.instrument_name.to_string(),
+            )
+        })
+        .collect()
 }
 
 fn build_underlying_runtimes(
@@ -212,6 +232,8 @@ fn wait_for_all_spot_anchors(
     active_summaries: &mut BTreeMap<String, FyersUniverseSummary>,
     latest_prices: &mut Option<FyersLatestPriceFile>,
     historical_candles: &mut HistoricalCandleService,
+    strategy_runtime: Option<&Arc<StrategyRuntimeHandle>>,
+    strategy_instrument_names: &BTreeMap<String, String>,
     config: &FyersBrokerSection,
     selection: &InstrumentSelection,
     log_to_console: bool,
@@ -226,6 +248,19 @@ fn wait_for_all_spot_anchors(
         };
 
         historical_candles.on_tick(&tick)?;
+
+        if let Some(strategy_runtime) = strategy_runtime {
+            let strategy_instrument = strategy_instrument_names
+                .get(tick.instrument_name.as_str())
+                .map(String::as_str)
+                .unwrap_or_else(|| tick.instrument_name.as_str());
+            strategy_runtime.on_tick(
+                strategy_instrument,
+                tick.price.as_f64(),
+                tick.time.as_u64(),
+                spot_to_underlying.contains_key(tick.instrument_name.as_str()),
+            )?;
+        }
 
         if let Some(latest_prices) = latest_prices.as_mut() {
             latest_prices.update_tick(&tick.instrument_name, tick.price.as_f64())?;
@@ -268,6 +303,8 @@ fn stream_live_ticks(
     active_summaries: &mut BTreeMap<String, FyersUniverseSummary>,
     latest_prices: &mut Option<FyersLatestPriceFile>,
     historical_candles: &mut HistoricalCandleService,
+    strategy_runtime: Option<&Arc<StrategyRuntimeHandle>>,
+    strategy_instrument_names: &BTreeMap<String, String>,
     config: &FyersBrokerSection,
     selection: &InstrumentSelection,
     max_events: usize,
@@ -284,6 +321,19 @@ fn stream_live_ticks(
         };
 
         historical_candles.on_tick(&tick)?;
+
+        if let Some(strategy_runtime) = strategy_runtime {
+            let strategy_instrument = strategy_instrument_names
+                .get(tick.instrument_name.as_str())
+                .map(String::as_str)
+                .unwrap_or_else(|| tick.instrument_name.as_str());
+            strategy_runtime.on_tick(
+                strategy_instrument,
+                tick.price.as_f64(),
+                tick.time.as_u64(),
+                spot_to_underlying.contains_key(tick.instrument_name.as_str()),
+            )?;
+        }
 
         if let Some(latest_prices) = latest_prices.as_mut() {
             latest_prices.update_tick(&tick.instrument_name, tick.price.as_f64())?;

@@ -79,6 +79,10 @@ pub fn notify_recovery(
     notification_service().notify_recovery(key.as_ref(), component.as_ref(), message);
 }
 
+pub fn notify_message(component: impl AsRef<str>, message: impl Into<String>) {
+    notification_service().notify_message(component.as_ref(), message);
+}
+
 fn notification_service() -> &'static NotificationService {
     NOTIFICATION_SERVICE.get_or_init(NotificationService::from_env)
 }
@@ -209,6 +213,16 @@ impl NotificationService {
         let text = format!(
             "DHANCRED RECOVERY\nHost: {}\nComponent: {}\nMessage: {}",
             self.host, component, message
+        );
+        self.send(text);
+    }
+
+    fn notify_message(&self, component: &str, message: impl Into<String>) {
+        let text = format!(
+            "DHANCRED EVENT\nHost: {}\nComponent: {}\nMessage: {}",
+            self.host,
+            component,
+            sanitize_message(message.into())
         );
         self.send(text);
     }
