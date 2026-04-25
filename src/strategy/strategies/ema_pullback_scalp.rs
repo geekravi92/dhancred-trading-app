@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Mutex;
 
 use serde::Deserialize;
@@ -41,22 +41,6 @@ impl Strategy for EmaPullbackScalpStrategy {
             return Ok(Vec::new());
         };
 
-        let state_key = StateKey::new(ssu.ssu_id, &event.trigger_instrument);
-        {
-            let mut states = self
-                .states
-                .lock()
-                .expect("ema pullback state lock poisoned");
-            let state = states.entry(state_key.clone()).or_default();
-            if state
-                .last_processed_closed_end
-                .is_some_and(|end_at| end_at >= closed_bar.end_at)
-            {
-                return Ok(Vec::new());
-            }
-            state.last_processed_closed_end = Some(closed_bar.end_at);
-        }
-
         let bars = ctx.timeframes.recent_bars(
             &event.trigger_instrument,
             settings.timeframe,
@@ -75,11 +59,11 @@ impl Strategy for EmaPullbackScalpStrategy {
             return Ok(exits);
         }
 
-        // Step 5: Search the latest closed candle as a continuation trigger.
-        for side in &settings.enabled_sides {
-            let Some(setup) = detect_setup(&bars, &series, &settings, *side) else {
-                continue;
-            };
+        // Step 5: Incrementally advance per-side setup state. Older warmup bars rebuild state,
+        // but only the current closed candle can emit a new live signal.
+        let entry_candidates =
+            self.advance_entry_states(ssu, event, &settings, &bars, closed_bar.end_at)?;
+        for setup in entry_candidates {
             // Step 6: Entry policy decides whether a valid setup can become a signal.
             if !self.entry_policy_allows(ctx, ssu, event, &settings, &setup)? {
                 continue;
@@ -151,9 +135,11 @@ impl Strategy for EmaPullbackScalpStrategy {
                 .states
                 .lock()
                 .expect("ema pullback state lock poisoned");
-            let state = states.entry(state_key.clone()).or_default();
+            let state_key = StateKey::new(ssu.ssu_id, &event.trigger_instrument, setup.side);
+            let state = states
+                .entry(state_key)
+                .or_insert_with(|| SetupState::new(&settings));
             state.entered_setup_ids.insert(setup.setup_id.clone());
-            state.last_breakout_level = Some(setup.breakout_level);
             state.last_entry_bar_end_at = Some(closed_bar.end_at);
             drop(states);
 
@@ -183,6 +169,42 @@ impl EmaPullbackScalpStrategy {
             .expect("ema pullback settings lock poisoned")
             .insert(ssu.ssu_id, settings.clone());
         Ok(settings)
+    }
+
+    fn advance_entry_states(
+        &self,
+        ssu: &SsuConfig,
+        event: &PriceUpdated,
+        settings: &EmaPullbackSettings,
+        bars: &[Bar],
+        current_closed_end: u64,
+    ) -> Result<Vec<DetectedSetup>, StrategyError> {
+        let mut candidates = Vec::new();
+        let mut states = self
+            .states
+            .lock()
+            .expect("ema pullback state lock poisoned");
+
+        for side in &settings.enabled_sides {
+            let state_key = StateKey::new(ssu.ssu_id, &event.trigger_instrument, *side);
+            let state = states
+                .entry(state_key)
+                .or_insert_with(|| SetupState::new(settings));
+            for bar in bars {
+                if state
+                    .last_processed_closed_end
+                    .is_some_and(|end_at| bar.end_at <= end_at)
+                {
+                    continue;
+                }
+                let may_emit = bar.end_at == current_closed_end;
+                if let Some(setup) = state.on_closed_bar(bar, settings, *side, may_emit)? {
+                    candidates.push(setup);
+                }
+            }
+        }
+
+        Ok(candidates)
     }
 
     fn manage_open_positions(
@@ -331,7 +353,7 @@ impl EmaPullbackScalpStrategy {
             .filter(|position| position.status == PositionStatus::Open)
             .collect::<Vec<_>>();
 
-        let state_key = StateKey::new(ssu.ssu_id, &event.trigger_instrument);
+        let state_key = StateKey::new(ssu.ssu_id, &event.trigger_instrument, setup.side);
         let states = self
             .states
             .lock()
@@ -856,38 +878,711 @@ enum PyramidStopAdjustment {
 struct StateKey {
     ssu_id: i64,
     instrument: String,
+    side: String,
 }
 
 impl StateKey {
-    fn new(ssu_id: i64, instrument: &str) -> Self {
+    fn new(ssu_id: i64, instrument: &str, side: SignalSide) -> Self {
         Self {
             ssu_id,
             instrument: instrument.to_string(),
+            side: side_label(side).to_string(),
         }
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct SetupState {
     last_processed_closed_end: Option<u64>,
     entered_setup_ids: BTreeSet<String>,
-    last_breakout_level: Option<f64>,
     last_entry_bar_end_at: Option<u64>,
+    indicators: IncrementalIndicators,
+    base: Option<BaseCandidate>,
+    setup: Option<SetupTracker>,
+}
+
+impl SetupState {
+    fn new(settings: &EmaPullbackSettings) -> Self {
+        Self {
+            last_processed_closed_end: None,
+            entered_setup_ids: BTreeSet::new(),
+            last_entry_bar_end_at: None,
+            indicators: IncrementalIndicators::new(settings),
+            base: None,
+            setup: None,
+        }
+    }
+
+    fn on_closed_bar(
+        &mut self,
+        bar: &Bar,
+        settings: &EmaPullbackSettings,
+        side: SignalSide,
+        may_emit: bool,
+    ) -> Result<Option<DetectedSetup>, StrategyError> {
+        self.last_processed_closed_end = Some(bar.end_at);
+        let Some(point) = self.indicators.update(bar)? else {
+            return Ok(None);
+        };
+
+        if let Some(setup) = self.setup.as_mut() {
+            match setup.on_closed_bar(bar, &point, settings) {
+                SetupAdvance::None => return Ok(None),
+                SetupAdvance::Invalid => {
+                    self.setup = None;
+                }
+                SetupAdvance::Entry(setup) => {
+                    self.setup = None;
+                    self.base = None;
+                    if may_emit && !self.entered_setup_ids.contains(&setup.setup_id) {
+                        return Ok(Some(setup));
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+
+        self.update_base(bar, &point, settings, side);
+        Ok(None)
+    }
+
+    fn update_base(
+        &mut self,
+        bar: &Bar,
+        point: &IndicatorPoint,
+        settings: &EmaPullbackSettings,
+        side: SignalSide,
+    ) {
+        let Some(mut base) = self.base.take() else {
+            self.base = BaseCandidate::start_if_valid(bar, point.atr, settings);
+            return;
+        };
+
+        if base.is_breakout(bar, point.atr, settings, side) {
+            self.setup = Some(SetupTracker::new(
+                BaseSnapshot::from_candidate(&base, side),
+                bar,
+                side,
+                point.atr,
+            ));
+            return;
+        }
+
+        if base.close_outside(bar) {
+            self.base = BaseCandidate::start_if_valid(bar, point.atr, settings);
+            return;
+        }
+
+        base.absorb(bar);
+        self.base = Some(base);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct IncrementalIndicators {
+    ema_fast: EmaTracker,
+    ema_slow: EmaTracker,
+    atr: AtrTracker,
+    fast_history: VecDeque<f64>,
+    fast_slope_lookback: usize,
+}
+
+impl IncrementalIndicators {
+    fn new(settings: &EmaPullbackSettings) -> Self {
+        Self {
+            ema_fast: EmaTracker::new(settings.ema_fast_period),
+            ema_slow: EmaTracker::new(settings.ema_slow_period),
+            atr: AtrTracker::new(settings.atr_period),
+            fast_history: VecDeque::new(),
+            fast_slope_lookback: settings.regime_ema_slope_lookback_bars,
+        }
+    }
+
+    fn update(&mut self, bar: &Bar) -> Result<Option<IndicatorPoint>, StrategyError> {
+        let Some(ema_fast) = self.ema_fast.update(bar.close)? else {
+            let _ = self.ema_slow.update(bar.close)?;
+            let _ = self.atr.update(bar)?;
+            return Ok(None);
+        };
+        self.fast_history.push_back(ema_fast);
+        while self.fast_history.len() > self.fast_slope_lookback.saturating_add(1) {
+            self.fast_history.pop_front();
+        }
+        let Some(ema_slow) = self.ema_slow.update(bar.close)? else {
+            let _ = self.atr.update(bar)?;
+            return Ok(None);
+        };
+        let Some(atr) = self.atr.update(bar)? else {
+            return Ok(None);
+        };
+        let Some(ema_fast_past) = self
+            .fast_history
+            .front()
+            .copied()
+            .filter(|_| self.fast_history.len() > self.fast_slope_lookback)
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(IndicatorPoint {
+            ema_fast,
+            ema_slow,
+            atr,
+            ema_fast_past,
+        }))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct IndicatorPoint {
+    ema_fast: f64,
+    ema_slow: f64,
+    atr: f64,
+    ema_fast_past: f64,
+}
+
+#[derive(Clone, Debug)]
+struct EmaTracker {
+    period: usize,
+    alpha: f64,
+    seed: Vec<f64>,
+    last: Option<f64>,
+}
+
+impl EmaTracker {
+    fn new(period: usize) -> Self {
+        Self {
+            period,
+            alpha: 2.0 / (period as f64 + 1.0),
+            seed: Vec::with_capacity(period),
+            last: None,
+        }
+    }
+
+    fn update(&mut self, close: f64) -> Result<Option<f64>, StrategyError> {
+        if self.period == 0 {
+            return Err(StrategyError::Config(
+                "EMA period must be positive".to_string(),
+            ));
+        }
+        if let Some(previous) = self.last {
+            let next = self.alpha * close + (1.0 - self.alpha) * previous;
+            self.last = Some(next);
+            return Ok(Some(next));
+        }
+
+        self.seed.push(close);
+        if self.seed.len() < self.period {
+            return Ok(None);
+        }
+        let initial = self.seed.iter().sum::<f64>() / self.period as f64;
+        self.last = Some(initial);
+        Ok(Some(initial))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AtrTracker {
+    period: usize,
+    previous_close: Option<f64>,
+    true_ranges: VecDeque<f64>,
+    sum: f64,
+}
+
+impl AtrTracker {
+    fn new(period: usize) -> Self {
+        Self {
+            period,
+            previous_close: None,
+            true_ranges: VecDeque::new(),
+            sum: 0.0,
+        }
+    }
+
+    fn update(&mut self, bar: &Bar) -> Result<Option<f64>, StrategyError> {
+        if self.period == 0 {
+            return Err(StrategyError::Config(
+                "ATR period must be positive".to_string(),
+            ));
+        }
+        let Some(previous_close) = self.previous_close.replace(bar.close) else {
+            return Ok(None);
+        };
+        let true_range = (bar.high - bar.low)
+            .max((bar.high - previous_close).abs())
+            .max((bar.low - previous_close).abs());
+        self.true_ranges.push_back(true_range);
+        self.sum += true_range;
+        while self.true_ranges.len() > self.period {
+            if let Some(oldest) = self.true_ranges.pop_front() {
+                self.sum -= oldest;
+            }
+        }
+        if self.true_ranges.len() == self.period {
+            Ok(Some(self.sum / self.period as f64))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BaseCandidate {
+    start_at: u64,
+    end_at: u64,
+    high: f64,
+    low: f64,
+    close_high: f64,
+    close_low: f64,
+    first_close: f64,
+    last_close: f64,
+    close_travel: f64,
+    max_single_bar_range: f64,
+    candle_count: usize,
+}
+
+impl BaseCandidate {
+    fn start_if_valid(bar: &Bar, atr: f64, settings: &EmaPullbackSettings) -> Option<Self> {
+        if !atr.is_finite() || atr <= 0.0 {
+            return None;
+        }
+        let range = bar.high - bar.low;
+        if range.is_finite()
+            && range >= 0.0
+            && range / atr <= settings.base_max_single_bar_range_atr
+        {
+            Some(Self::start(bar))
+        } else {
+            None
+        }
+    }
+
+    fn start(bar: &Bar) -> Self {
+        Self {
+            start_at: bar.start_at,
+            end_at: bar.end_at,
+            high: bar.high,
+            low: bar.low,
+            close_high: bar.close,
+            close_low: bar.close,
+            first_close: bar.close,
+            last_close: bar.close,
+            close_travel: 0.0,
+            max_single_bar_range: bar.high - bar.low,
+            candle_count: 1,
+        }
+    }
+
+    fn absorb(&mut self, bar: &Bar) {
+        self.end_at = bar.end_at;
+        self.high = self.high.max(bar.high);
+        self.low = self.low.min(bar.low);
+        self.close_high = self.close_high.max(bar.close);
+        self.close_low = self.close_low.min(bar.close);
+        self.close_travel += (bar.close - self.last_close).abs();
+        self.last_close = bar.close;
+        self.max_single_bar_range = self.max_single_bar_range.max(bar.high - bar.low);
+        self.candle_count += 1;
+    }
+
+    fn is_breakout(
+        &self,
+        bar: &Bar,
+        atr: f64,
+        settings: &EmaPullbackSettings,
+        side: SignalSide,
+    ) -> bool {
+        self.is_ready(settings, atr)
+            && breakout_valid(bar, settings, side, self.breakout_level(side), atr)
+    }
+
+    fn is_ready(&self, settings: &EmaPullbackSettings, atr: f64) -> bool {
+        self.candle_count >= settings.base_window_bars && self.is_structurally_valid(settings, atr)
+    }
+
+    fn is_structurally_valid(&self, settings: &EmaPullbackSettings, atr: f64) -> bool {
+        if !atr.is_finite() || atr <= 0.0 {
+            return false;
+        }
+        self.range() / atr <= settings.base_max_range_atr
+            && (self.close_high - self.close_low) / atr <= settings.base_max_close_spread_atr
+            && self.max_single_bar_range / atr <= settings.base_max_single_bar_range_atr
+            && self.directional_efficiency() <= settings.base_max_directional_efficiency
+    }
+
+    fn breakout_level(&self, side: SignalSide) -> f64 {
+        match side {
+            SignalSide::Long => self.high,
+            SignalSide::Short => self.low,
+        }
+    }
+
+    fn close_outside(&self, bar: &Bar) -> bool {
+        bar.close > self.high || bar.close < self.low
+    }
+
+    fn range(&self) -> f64 {
+        self.high - self.low
+    }
+
+    fn directional_efficiency(&self) -> f64 {
+        if self.close_travel <= 0.0 {
+            0.0
+        } else {
+            (self.last_close - self.first_close).abs() / self.close_travel
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BaseSnapshot {
+    start_at: u64,
+    end_at: u64,
+    breakout_level: f64,
+}
+
+impl BaseSnapshot {
+    fn from_candidate(candidate: &BaseCandidate, side: SignalSide) -> Self {
+        Self {
+            start_at: candidate.start_at,
+            end_at: candidate.end_at,
+            breakout_level: candidate.breakout_level(side),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SetupTracker {
+    base: BaseSnapshot,
+    side: SignalSide,
+    phase: SetupPhase,
+    breakout_bar_end_at: u64,
+    breakout_atr: f64,
+    swing_start_price: f64,
+    swing_extreme_price: f64,
+    swing_extreme_bar_end_at: u64,
+    impulse_bars: Vec<Bar>,
+    pullback_bars: Vec<Bar>,
+    pullback_extreme_price: Option<f64>,
+    pullback_extreme_bar_end_at: Option<u64>,
+    pullback_touched_ema_zone: bool,
+}
+
+impl SetupTracker {
+    fn new(base: BaseSnapshot, breakout_bar: &Bar, side: SignalSide, breakout_atr: f64) -> Self {
+        let swing_start_price = match side {
+            SignalSide::Long => breakout_bar.low,
+            SignalSide::Short => breakout_bar.high,
+        };
+        let swing_extreme_price = match side {
+            SignalSide::Long => breakout_bar.high,
+            SignalSide::Short => breakout_bar.low,
+        };
+        Self {
+            base,
+            side,
+            phase: SetupPhase::Impulse,
+            breakout_bar_end_at: breakout_bar.end_at,
+            breakout_atr,
+            swing_start_price,
+            swing_extreme_price,
+            swing_extreme_bar_end_at: breakout_bar.end_at,
+            impulse_bars: vec![breakout_bar.clone()],
+            pullback_bars: Vec::new(),
+            pullback_extreme_price: None,
+            pullback_extreme_bar_end_at: None,
+            pullback_touched_ema_zone: false,
+        }
+    }
+
+    fn on_closed_bar(
+        &mut self,
+        bar: &Bar,
+        point: &IndicatorPoint,
+        settings: &EmaPullbackSettings,
+    ) -> SetupAdvance {
+        if bar.end_at <= self.breakout_bar_end_at {
+            return SetupAdvance::None;
+        }
+
+        match self.phase {
+            SetupPhase::Impulse => self.advance_impulse(bar, point, settings),
+            SetupPhase::Pullback => {
+                if let Some(setup) = self.try_trigger(bar, point, settings) {
+                    SetupAdvance::Entry(setup)
+                } else {
+                    self.advance_pullback(bar, point, settings)
+                }
+            }
+        }
+    }
+
+    fn advance_impulse(
+        &mut self,
+        bar: &Bar,
+        point: &IndicatorPoint,
+        settings: &EmaPullbackSettings,
+    ) -> SetupAdvance {
+        if self.makes_new_swing_extreme(bar) {
+            self.impulse_bars.push(bar.clone());
+            self.update_swing_extreme(bar);
+            if self.impulse_bars.len() > settings.impulse_max_bars.saturating_add(1) {
+                SetupAdvance::Invalid
+            } else {
+                SetupAdvance::None
+            }
+        } else if self.impulse_valid(settings) {
+            self.phase = SetupPhase::Pullback;
+            self.advance_pullback(bar, point, settings)
+        } else {
+            SetupAdvance::Invalid
+        }
+    }
+
+    fn advance_pullback(
+        &mut self,
+        bar: &Bar,
+        point: &IndicatorPoint,
+        settings: &EmaPullbackSettings,
+    ) -> SetupAdvance {
+        self.pullback_bars.push(bar.clone());
+        self.update_pullback_extreme(bar);
+        if self.pullback_bars.len() > settings.pullback_max_bars {
+            return SetupAdvance::Invalid;
+        }
+        if !breakout_level_respected(
+            self.pullback_extreme_price
+                .expect("pullback extreme exists after push"),
+            self.base.breakout_level,
+            self.side,
+            point.atr,
+            settings.max_breakout_level_penetration_atr,
+        ) {
+            return SetupAdvance::Invalid;
+        }
+        if self
+            .pullback_ratio()
+            .is_some_and(|ratio| ratio > settings.pullback_max_ratio)
+        {
+            return SetupAdvance::Invalid;
+        }
+        if self.pullback_bars.len() >= settings.pullback_min_bars
+            && pullback_counter_efficiency(&self.pullback_bars)
+                > settings.pullback_max_counter_efficiency
+        {
+            return SetupAdvance::Invalid;
+        }
+        let touch_price = match self.side {
+            SignalSide::Long => bar.low,
+            SignalSide::Short => bar.high,
+        };
+        if pullback_touches_ema_zone(
+            touch_price,
+            point.ema_fast,
+            point.ema_slow,
+            point.atr,
+            settings.ema_zone_buffer_atr,
+        ) {
+            self.pullback_touched_ema_zone = true;
+        }
+        SetupAdvance::None
+    }
+
+    fn try_trigger(
+        &self,
+        trigger_bar: &Bar,
+        point: &IndicatorPoint,
+        settings: &EmaPullbackSettings,
+    ) -> Option<DetectedSetup> {
+        if self.pullback_bars.len() < settings.pullback_min_bars
+            || !self.pullback_touched_ema_zone
+            || !regime_valid_point(point, settings, self.side)
+        {
+            return None;
+        }
+        let pullback_ratio = self.pullback_ratio()?;
+        if pullback_ratio < settings.pullback_min_ratio
+            || pullback_ratio > settings.pullback_max_ratio
+            || pullback_counter_efficiency(&self.pullback_bars)
+                > settings.pullback_max_counter_efficiency
+        {
+            return None;
+        }
+        if !trigger_valid(
+            &self.pullback_bars,
+            trigger_bar,
+            self.side,
+            settings,
+            point.atr,
+            point.ema_fast,
+            point.ema_slow,
+        ) {
+            return None;
+        }
+        Some(self.detected_setup(trigger_bar, point.atr, pullback_ratio))
+    }
+
+    fn detected_setup(&self, trigger_bar: &Bar, atr: f64, pullback_ratio: f64) -> DetectedSetup {
+        let pullback_extreme_price = self
+            .pullback_extreme_price
+            .expect("detected setup requires pullback extreme");
+        let pullback_extreme_bar_end_at = self
+            .pullback_extreme_bar_end_at
+            .expect("detected setup requires pullback extreme time");
+        let impulse_height = self.impulse_height();
+        let impulse_atr = impulse_height / self.breakout_atr;
+        DetectedSetup {
+            side: self.side,
+            setup_id: format!(
+                "{}|{}|{}|{}|{}|{}|{}|{}",
+                trigger_bar.instrument,
+                timeframe_label(trigger_bar.timeframe),
+                side_label(self.side),
+                self.base.start_at,
+                self.base.end_at,
+                self.breakout_bar_end_at,
+                self.swing_extreme_bar_end_at,
+                pullback_extreme_bar_end_at
+            ),
+            base_start_at: self.base.start_at,
+            base_end_at: self.base.end_at,
+            breakout_bar_end_at: self.breakout_bar_end_at,
+            breakout_level: self.base.breakout_level,
+            swing_extreme_bar_end_at: self.swing_extreme_bar_end_at,
+            pullback_extreme_bar_end_at,
+            swing_start_price: self.swing_start_price,
+            swing_extreme_price: self.swing_extreme_price,
+            pullback_extreme_price,
+            impulse_height,
+            pullback_ratio,
+            impulse_atr,
+            atr,
+            trigger_close: trigger_bar.close,
+        }
+    }
+
+    fn makes_new_swing_extreme(&self, bar: &Bar) -> bool {
+        match self.side {
+            SignalSide::Long => bar.high > self.swing_extreme_price,
+            SignalSide::Short => bar.low < self.swing_extreme_price,
+        }
+    }
+
+    fn update_swing_extreme(&mut self, bar: &Bar) {
+        match self.side {
+            SignalSide::Long => {
+                if bar.high > self.swing_extreme_price {
+                    self.swing_extreme_price = bar.high;
+                    self.swing_extreme_bar_end_at = bar.end_at;
+                }
+            }
+            SignalSide::Short => {
+                if bar.low < self.swing_extreme_price {
+                    self.swing_extreme_price = bar.low;
+                    self.swing_extreme_bar_end_at = bar.end_at;
+                }
+            }
+        }
+    }
+
+    fn update_pullback_extreme(&mut self, bar: &Bar) {
+        match self.side {
+            SignalSide::Long => {
+                if self
+                    .pullback_extreme_price
+                    .is_none_or(|extreme| bar.low < extreme)
+                {
+                    self.pullback_extreme_price = Some(bar.low);
+                    self.pullback_extreme_bar_end_at = Some(bar.end_at);
+                }
+            }
+            SignalSide::Short => {
+                if self
+                    .pullback_extreme_price
+                    .is_none_or(|extreme| bar.high > extreme)
+                {
+                    self.pullback_extreme_price = Some(bar.high);
+                    self.pullback_extreme_bar_end_at = Some(bar.end_at);
+                }
+            }
+        }
+    }
+
+    fn impulse_valid(&self, settings: &EmaPullbackSettings) -> bool {
+        let impulse_height = self.impulse_height();
+        impulse_height > 0.0
+            && impulse_height / self.breakout_atr >= settings.impulse_min_height_atr
+            && pullback_counter_efficiency(&self.impulse_bars) >= settings.impulse_min_efficiency
+    }
+
+    fn impulse_height(&self) -> f64 {
+        match self.side {
+            SignalSide::Long => self.swing_extreme_price - self.swing_start_price,
+            SignalSide::Short => self.swing_start_price - self.swing_extreme_price,
+        }
+    }
+
+    fn pullback_ratio(&self) -> Option<f64> {
+        let pullback_extreme = self.pullback_extreme_price?;
+        let impulse_height = self.impulse_height();
+        if impulse_height <= 0.0 {
+            return None;
+        }
+        let pullback_depth = match self.side {
+            SignalSide::Long => self.swing_extreme_price - pullback_extreme,
+            SignalSide::Short => pullback_extreme - self.swing_extreme_price,
+        };
+        Some(pullback_depth / impulse_height)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SetupPhase {
+    Impulse,
+    Pullback,
+}
+
+#[derive(Clone, Debug)]
+enum SetupAdvance {
+    None,
+    Invalid,
+    Entry(DetectedSetup),
+}
+
+fn regime_valid_point(
+    point: &IndicatorPoint,
+    settings: &EmaPullbackSettings,
+    side: SignalSide,
+) -> bool {
+    let slope_atr = (point.ema_fast - point.ema_fast_past) / point.atr;
+    let separation_atr = (point.ema_fast - point.ema_slow).abs() / point.atr;
+    match side {
+        SignalSide::Long => {
+            point.ema_fast > point.ema_slow
+                && slope_atr >= settings.regime_min_fast_slope_atr
+                && separation_atr >= settings.regime_min_ema_separation_atr
+        }
+        SignalSide::Short => {
+            point.ema_fast < point.ema_slow
+                && slope_atr <= -settings.regime_min_fast_slope_atr
+                && separation_atr >= settings.regime_min_ema_separation_atr
+        }
+    }
+}
+
+fn pullback_counter_efficiency(bars: &[Bar]) -> f64 {
+    efficiency(bars).unwrap_or(0.0)
 }
 
 #[derive(Clone, Debug)]
 struct IndicatorSeries {
-    ema_fast: Vec<Option<f64>>,
     ema_slow: Vec<Option<f64>>,
-    atr: Vec<Option<f64>>,
 }
 
 impl IndicatorSeries {
     fn from_bars(bars: &[Bar], settings: &EmaPullbackSettings) -> Result<Self, StrategyError> {
         Ok(Self {
-            ema_fast: ema_series(bars, settings.ema_fast_period)?,
             ema_slow: ema_series(bars, settings.ema_slow_period)?,
-            atr: atr_series(bars, settings.atr_period)?,
         })
     }
 }
@@ -990,224 +1685,6 @@ impl DetectedSetup {
     }
 }
 
-fn detect_setup(
-    bars: &[Bar],
-    series: &IndicatorSeries,
-    settings: &EmaPullbackSettings,
-    side: SignalSide,
-) -> Option<DetectedSetup> {
-    // State 1: Regime must already favor the requested side.
-    let trigger_idx = bars.len().checked_sub(1)?;
-    let atr_last = series.atr.get(trigger_idx).copied().flatten()?;
-    if !regime_valid(bars, series, settings, side, trigger_idx, atr_last) {
-        return None;
-    }
-
-    let min_breakout_idx = settings.base_window_bars;
-    let max_breakout_idx = trigger_idx
-        .checked_sub(settings.pullback_min_bars)?
-        .checked_sub(1)?;
-
-    for breakout_idx in (min_breakout_idx..=max_breakout_idx).rev() {
-        // State 2: A tight base must exist immediately before breakout.
-        let atr_breakout = series.atr.get(breakout_idx).copied().flatten()?;
-        let base_start = breakout_idx.checked_sub(settings.base_window_bars)?;
-        let base = &bars[base_start..breakout_idx];
-        let (base_high, base_low) = valid_base(base, settings, atr_breakout)?;
-        let breakout_bar = &bars[breakout_idx];
-        let breakout_level = match side {
-            SignalSide::Long => base_high,
-            SignalSide::Short => base_low,
-        };
-        if !breakout_valid(breakout_bar, settings, side, breakout_level, atr_breakout) {
-            continue;
-        }
-
-        // State 3: Breakout must become an efficient impulse within the configured window.
-        let max_impulse_end = (breakout_idx + settings.impulse_max_bars).min(trigger_idx - 1);
-        let Some((swing_idx, swing_extreme)) =
-            swing_extreme(&bars[breakout_idx..=max_impulse_end], side)
-        else {
-            continue;
-        };
-        let swing_idx = breakout_idx + swing_idx;
-        if swing_idx >= trigger_idx {
-            continue;
-        }
-        let swing_start_price = match side {
-            SignalSide::Long => breakout_bar.low,
-            SignalSide::Short => breakout_bar.high,
-        };
-        let impulse_height = match side {
-            SignalSide::Long => swing_extreme - swing_start_price,
-            SignalSide::Short => swing_start_price - swing_extreme,
-        };
-        if impulse_height <= 0.0 {
-            continue;
-        }
-        let impulse_atr = impulse_height / atr_breakout;
-        if impulse_atr < settings.impulse_min_height_atr {
-            continue;
-        }
-        let impulse_efficiency = efficiency(&bars[breakout_idx..=swing_idx])?;
-        if impulse_efficiency < settings.impulse_min_efficiency {
-            continue;
-        }
-
-        // State 4: Impulse must retrace into a healthy EMA-zone pullback.
-        let pullback_start = swing_idx + 1;
-        let pullback_end = trigger_idx - 1;
-        if pullback_end < pullback_start {
-            continue;
-        }
-        let pullback_bars = pullback_end - pullback_start + 1;
-        if pullback_bars < settings.pullback_min_bars || pullback_bars > settings.pullback_max_bars
-        {
-            continue;
-        }
-        let (pullback_idx, pullback_extreme) =
-            pullback_extreme(&bars[pullback_start..=pullback_end], side)?;
-        let pullback_idx = pullback_start + pullback_idx;
-        let pullback_depth = match side {
-            SignalSide::Long => swing_extreme - pullback_extreme,
-            SignalSide::Short => pullback_extreme - swing_extreme,
-        };
-        let pullback_ratio = pullback_depth / impulse_height;
-        if pullback_ratio < settings.pullback_min_ratio
-            || pullback_ratio > settings.pullback_max_ratio
-        {
-            continue;
-        }
-        let pullback_counter_efficiency = efficiency(&bars[pullback_start..=pullback_end])?;
-        if pullback_counter_efficiency > settings.pullback_max_counter_efficiency {
-            continue;
-        }
-        let atr_pullback = series.atr.get(pullback_idx).copied().flatten()?;
-        let ema_fast = series.ema_fast.get(pullback_idx).copied().flatten()?;
-        let ema_slow = series.ema_slow.get(pullback_idx).copied().flatten()?;
-        if !pullback_touches_ema_zone(
-            pullback_extreme,
-            ema_fast,
-            ema_slow,
-            atr_pullback,
-            settings.ema_zone_buffer_atr,
-        ) {
-            continue;
-        }
-        if !breakout_level_respected(
-            pullback_extreme,
-            breakout_level,
-            side,
-            atr_pullback,
-            settings.max_breakout_level_penetration_atr,
-        ) {
-            continue;
-        }
-        let trigger_bar = &bars[trigger_idx];
-
-        // State 5: Latest candle must prove renewed continuation before entry.
-        if !trigger_valid(
-            &bars[pullback_start..=pullback_end],
-            trigger_bar,
-            side,
-            settings,
-            atr_last,
-            series.ema_fast[trigger_idx]?,
-            series.ema_slow[trigger_idx]?,
-        ) {
-            continue;
-        }
-
-        return Some(DetectedSetup {
-            side,
-            setup_id: format!(
-                "{}|{}|{}|{}|{}|{}|{}|{}",
-                bars[trigger_idx].instrument,
-                timeframe_label(bars[trigger_idx].timeframe),
-                side_label(side),
-                bars[base_start].start_at,
-                bars[breakout_idx - 1].end_at,
-                breakout_bar.end_at,
-                bars[swing_idx].end_at,
-                bars[pullback_idx].end_at
-            ),
-            base_start_at: bars[base_start].start_at,
-            base_end_at: bars[breakout_idx - 1].end_at,
-            breakout_bar_end_at: breakout_bar.end_at,
-            breakout_level,
-            swing_extreme_bar_end_at: bars[swing_idx].end_at,
-            pullback_extreme_bar_end_at: bars[pullback_idx].end_at,
-            swing_start_price,
-            swing_extreme_price: swing_extreme,
-            pullback_extreme_price: pullback_extreme,
-            impulse_height,
-            pullback_ratio,
-            impulse_atr,
-            atr: atr_last,
-            trigger_close: trigger_bar.close,
-        });
-    }
-
-    None
-}
-
-fn regime_valid(
-    _bars: &[Bar],
-    series: &IndicatorSeries,
-    settings: &EmaPullbackSettings,
-    side: SignalSide,
-    index: usize,
-    atr: f64,
-) -> bool {
-    let Some(past_index) = index.checked_sub(settings.regime_ema_slope_lookback_bars) else {
-        return false;
-    };
-    let Some(ema_fast) = series.ema_fast[index] else {
-        return false;
-    };
-    let Some(ema_slow) = series.ema_slow[index] else {
-        return false;
-    };
-    let Some(ema_fast_past) = series.ema_fast[past_index] else {
-        return false;
-    };
-    let slope_atr = (ema_fast - ema_fast_past) / atr;
-    let separation_atr = (ema_fast - ema_slow).abs() / atr;
-    match side {
-        SignalSide::Long => {
-            ema_fast > ema_slow
-                && slope_atr >= settings.regime_min_fast_slope_atr
-                && separation_atr >= settings.regime_min_ema_separation_atr
-        }
-        SignalSide::Short => {
-            ema_fast < ema_slow
-                && slope_atr <= -settings.regime_min_fast_slope_atr
-                && separation_atr >= settings.regime_min_ema_separation_atr
-        }
-    }
-}
-
-fn valid_base(bars: &[Bar], settings: &EmaPullbackSettings, atr: f64) -> Option<(f64, f64)> {
-    let base_high = bars.iter().map(|bar| bar.high).fold(f64::MIN, f64::max);
-    let base_low = bars.iter().map(|bar| bar.low).fold(f64::MAX, f64::min);
-    let close_high = bars.iter().map(|bar| bar.close).fold(f64::MIN, f64::max);
-    let close_low = bars.iter().map(|bar| bar.close).fold(f64::MAX, f64::min);
-    let max_single_bar_range = bars
-        .iter()
-        .map(|bar| bar.high - bar.low)
-        .fold(0.0, f64::max);
-    let base_efficiency = efficiency(bars)?;
-    if (base_high - base_low) / atr <= settings.base_max_range_atr
-        && (close_high - close_low) / atr <= settings.base_max_close_spread_atr
-        && max_single_bar_range / atr <= settings.base_max_single_bar_range_atr
-        && base_efficiency <= settings.base_max_directional_efficiency
-    {
-        Some((base_high, base_low))
-    } else {
-        None
-    }
-}
-
 fn breakout_valid(
     bar: &Bar,
     settings: &EmaPullbackSettings,
@@ -1286,29 +1763,6 @@ fn ema_series(bars: &[Bar], period: usize) -> Result<Vec<Option<f64>>, StrategyE
     Ok(values)
 }
 
-fn atr_series(bars: &[Bar], period: usize) -> Result<Vec<Option<f64>>, StrategyError> {
-    if period == 0 {
-        return Err(StrategyError::Config(
-            "ATR period must be positive".to_string(),
-        ));
-    }
-    let mut values = vec![None; bars.len()];
-    if bars.len() <= period {
-        return Ok(values);
-    }
-    let mut true_ranges = vec![0.0; bars.len()];
-    for index in 1..bars.len() {
-        true_ranges[index] = (bars[index].high - bars[index].low)
-            .max((bars[index].high - bars[index - 1].close).abs())
-            .max((bars[index].low - bars[index - 1].close).abs());
-    }
-    for index in period..bars.len() {
-        let start = index + 1 - period;
-        values[index] = Some(true_ranges[start..=index].iter().sum::<f64>() / period as f64);
-    }
-    Ok(values)
-}
-
 fn efficiency(bars: &[Bar]) -> Option<f64> {
     if bars.len() < 2 {
         return None;
@@ -1322,36 +1776,6 @@ fn efficiency(bars: &[Bar]) -> Option<f64> {
         None
     } else {
         Some(direct / travel)
-    }
-}
-
-fn swing_extreme(bars: &[Bar], side: SignalSide) -> Option<(usize, f64)> {
-    match side {
-        SignalSide::Long => bars
-            .iter()
-            .enumerate()
-            .max_by(|(_, left), (_, right)| left.high.total_cmp(&right.high))
-            .map(|(index, bar)| (index, bar.high)),
-        SignalSide::Short => bars
-            .iter()
-            .enumerate()
-            .min_by(|(_, left), (_, right)| left.low.total_cmp(&right.low))
-            .map(|(index, bar)| (index, bar.low)),
-    }
-}
-
-fn pullback_extreme(bars: &[Bar], side: SignalSide) -> Option<(usize, f64)> {
-    match side {
-        SignalSide::Long => bars
-            .iter()
-            .enumerate()
-            .min_by(|(_, left), (_, right)| left.low.total_cmp(&right.low))
-            .map(|(index, bar)| (index, bar.low)),
-        SignalSide::Short => bars
-            .iter()
-            .enumerate()
-            .max_by(|(_, left), (_, right)| left.high.total_cmp(&right.high))
-            .map(|(index, bar)| (index, bar.high)),
     }
 }
 
@@ -1554,6 +1978,20 @@ fn signal_type_label_for_side(side: SignalSide, entry: bool) -> &'static str {
 mod tests {
     use super::*;
 
+    fn test_bar(index: u64, open: f64, high: f64, low: f64, close: f64) -> Bar {
+        Bar {
+            instrument: "BTCUSD".to_string(),
+            timeframe: Timeframe::OneMinute,
+            start_at: index * 60_000,
+            end_at: (index + 1) * 60_000,
+            open,
+            high,
+            low,
+            close,
+            is_closed: true,
+        }
+    }
+
     fn complete_params() -> String {
         serde_json::json!({
             "timeframe": "1m",
@@ -1599,6 +2037,149 @@ mod tests {
             "pyramid_max_active_legs": 0
         })
         .to_string()
+    }
+
+    fn complete_settings() -> EmaPullbackSettings {
+        let ssu = SsuConfig {
+            ssu_id: 1,
+            strategy_key: "ema_pullback_scalp".to_string(),
+            enabled: true,
+            trade_gap_secs: 0,
+            max_overlap: 0,
+            max_positions_per_day: 0,
+            required_timeframes: vec![Timeframe::OneMinute],
+            indicator_specs: Vec::new(),
+            params_json: complete_params(),
+        };
+        EmaPullbackSettings::from_ssu(&ssu).expect("settings")
+    }
+
+    #[test]
+    fn base_absorbs_wick_expansion_when_close_remains_inside() {
+        let settings = complete_settings();
+        let mut base = BaseCandidate::start(&test_bar(1, 100.0, 110.0, 100.0, 106.0));
+        let wick_expansion = test_bar(2, 106.0, 112.0, 101.0, 108.0);
+
+        assert!(!base.close_outside(&wick_expansion));
+        assert!(!base.is_breakout(&wick_expansion, 10.0, &settings, SignalSide::Long));
+
+        base.absorb(&wick_expansion);
+        assert_eq!(base.start_at, 60_000);
+        assert_eq!(base.high, 112.0);
+        assert_eq!(base.candle_count, 2);
+    }
+
+    #[test]
+    fn large_wick_close_inside_does_not_restart_base() {
+        let settings = complete_settings();
+        let mut state = SetupState::new(&settings);
+        let point = IndicatorPoint {
+            ema_fast: 105.0,
+            ema_slow: 103.0,
+            atr: 10.0,
+            ema_fast_past: 100.0,
+        };
+
+        state.update_base(
+            &test_bar(1, 100.0, 110.0, 100.0, 106.0),
+            &point,
+            &settings,
+            SignalSide::Long,
+        );
+        state.update_base(
+            &test_bar(2, 106.0, 140.0, 90.0, 108.0),
+            &point,
+            &settings,
+            SignalSide::Long,
+        );
+
+        let base = state.base.expect("base should remain active");
+        assert_eq!(base.start_at, 60_000);
+        assert_eq!(base.high, 140.0);
+        assert_eq!(base.low, 90.0);
+        assert_eq!(base.candle_count, 2);
+        assert!(!base.is_structurally_valid(&settings, point.atr));
+    }
+
+    #[test]
+    fn broken_base_restarts_only_from_valid_anchor_candle() {
+        let mut settings = complete_settings();
+        settings.base_window_bars = 2;
+        let mut state = SetupState::new(&settings);
+        let point = IndicatorPoint {
+            ema_fast: 105.0,
+            ema_slow: 103.0,
+            atr: 10.0,
+            ema_fast_past: 100.0,
+        };
+
+        state.update_base(
+            &test_bar(1, 100.0, 110.0, 100.0, 106.0),
+            &point,
+            &settings,
+            SignalSide::Long,
+        );
+        state.update_base(
+            &test_bar(2, 106.0, 109.0, 101.0, 106.0),
+            &point,
+            &settings,
+            SignalSide::Long,
+        );
+        state.update_base(
+            &test_bar(3, 106.0, 180.0, 90.0, 130.0),
+            &point,
+            &settings,
+            SignalSide::Long,
+        );
+        assert!(state.base.is_none());
+
+        state.update_base(
+            &test_bar(4, 130.0, 136.0, 128.0, 132.0),
+            &point,
+            &settings,
+            SignalSide::Long,
+        );
+        let base = state.base.expect("valid anchor should start base");
+        assert_eq!(base.start_at, 240_000);
+        assert_eq!(base.candle_count, 1);
+    }
+
+    #[test]
+    fn close_breakout_freezes_base_and_starts_setup_tracker() {
+        let mut settings = complete_settings();
+        settings.base_window_bars = 2;
+        let mut state = SetupState::new(&settings);
+        let point = IndicatorPoint {
+            ema_fast: 105.0,
+            ema_slow: 103.0,
+            atr: 10.0,
+            ema_fast_past: 100.0,
+        };
+
+        state.update_base(
+            &test_bar(1, 100.0, 110.0, 100.0, 106.0),
+            &point,
+            &settings,
+            SignalSide::Long,
+        );
+        state.update_base(
+            &test_bar(2, 106.0, 109.0, 101.0, 106.0),
+            &point,
+            &settings,
+            SignalSide::Long,
+        );
+        state.update_base(
+            &test_bar(3, 107.0, 114.0, 106.0, 113.0),
+            &point,
+            &settings,
+            SignalSide::Long,
+        );
+
+        assert!(state.base.is_none());
+        assert!(matches!(
+            state.setup.as_ref().map(|setup| setup.phase),
+            Some(SetupPhase::Impulse)
+        ));
     }
 
     #[test]
