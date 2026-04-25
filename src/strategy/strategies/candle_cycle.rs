@@ -4,8 +4,8 @@ use std::sync::Mutex;
 use serde::Deserialize;
 
 use crate::strategy::{
-    EntrySignal, ExitSignal, PositionStatus, PriceUpdated, SignalSide, Strategy,
-    StrategyContext, StrategyError, StrategySignal, SsuConfig, Timeframe, TimeframeUpdate,
+    PositionStatus, PriceUpdated, SignalSide, SsuConfig, Strategy, StrategyContext, StrategyError,
+    StrategySignal, Timeframe, TimeframeUpdate,
 };
 
 #[derive(Debug, Default)]
@@ -39,7 +39,10 @@ impl Strategy for CandleCycleStrategy {
         };
 
         let state_key = StateKey::new(ssu.ssu_id, &event.trigger_instrument);
-        let mut states = self.states.lock().expect("candle cycle state lock poisoned");
+        let mut states = self
+            .states
+            .lock()
+            .expect("candle cycle state lock poisoned");
         let state = states.entry(state_key).or_default();
         if state
             .last_processed_closed_end
@@ -58,7 +61,8 @@ impl Strategy for CandleCycleStrategy {
                     && position.side == settings.side
                     && position.status == PositionStatus::Open
             });
-        let execution_price = current_ltp(ctx, &event.trigger_instrument).unwrap_or(closed_bar.close);
+        let execution_price =
+            current_ltp(ctx, &event.trigger_instrument).unwrap_or(closed_bar.close);
 
         if has_open_position {
             state.bars_since_entry = state.bars_since_entry.saturating_add(1);
@@ -68,22 +72,22 @@ impl Strategy for CandleCycleStrategy {
 
             state.bars_since_entry = 0;
             state.cooldown_remaining = settings.cooldown_candles;
-            let signal = ExitSignal {
-                ssu_id: ssu.ssu_id,
-                trigger_instrument: event.trigger_instrument.clone(),
-                trade_instrument: event.trigger_instrument.clone(),
-                side: settings.side,
-                price: execution_price,
-                reason: format!(
+            let signal = StrategySignal::single_leg_exit(
+                ssu.ssu_id,
+                self.strategy_key(),
+                &event.trigger_instrument,
+                settings.side,
+                execution_price,
+                format!(
                     "candle_cycle_exit|timeframe={}|held={}|closed_bar_end={}",
                     timeframe_label(settings.timeframe),
                     settings.hold_candles,
                     closed_bar.end_at
                 ),
-                at: event.at,
-            };
+                event.at,
+            );
             return match ctx.strategy_positions.close_position(&signal) {
-                Ok(_) => Ok(vec![StrategySignal::Exit(signal)]),
+                Ok(_) => Ok(vec![signal]),
                 Err(StrategyError::Rule(_)) | Err(StrategyError::NotFound(_)) => Ok(Vec::new()),
                 Err(error) => Err(error),
             };
@@ -97,23 +101,23 @@ impl Strategy for CandleCycleStrategy {
         }
 
         state.bars_since_entry = 0;
-        let signal = EntrySignal {
-            ssu_id: ssu.ssu_id,
-            trigger_instrument: event.trigger_instrument.clone(),
-            trade_instrument: event.trigger_instrument.clone(),
-            side: settings.side,
-            price: execution_price,
-            reason: format!(
+        let signal = StrategySignal::single_leg_entry(
+            ssu.ssu_id,
+            self.strategy_key(),
+            &event.trigger_instrument,
+            settings.side,
+            execution_price,
+            format!(
                 "candle_cycle_entry|timeframe={}|hold={}|cooldown={}|closed_bar_end={}",
                 timeframe_label(settings.timeframe),
                 settings.hold_candles,
                 settings.cooldown_candles,
                 closed_bar.end_at
             ),
-            at: event.at,
-        };
+            event.at,
+        );
         match ctx.strategy_positions.open_position(&signal, ssu) {
-            Ok(_) => Ok(vec![StrategySignal::Entry(signal)]),
+            Ok(_) => Ok(vec![signal]),
             Err(StrategyError::Rule(_)) => Ok(Vec::new()),
             Err(error) => Err(error),
         }
@@ -227,7 +231,9 @@ struct CycleState {
 }
 
 fn current_ltp(ctx: &StrategyContext, instrument: &str) -> Option<f64> {
-    ctx.prices.get_price(instrument).map(|snapshot| snapshot.ltp)
+    ctx.prices
+        .get_price(instrument)
+        .map(|snapshot| snapshot.ltp)
 }
 
 fn default_timeframe(ssu: &SsuConfig) -> Result<Timeframe, StrategyError> {

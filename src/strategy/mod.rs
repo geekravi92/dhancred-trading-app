@@ -2,6 +2,7 @@ mod error;
 mod history;
 mod price_store;
 mod runtime;
+mod signal;
 mod strategies;
 mod timeframes;
 
@@ -11,11 +12,16 @@ pub use error::StrategyError;
 pub use history::{HistoricalReplayStore, SqliteHistoricalReplayStore};
 pub use price_store::{InMemoryPriceStore, PriceStore};
 pub use runtime::{
-    BuiltinStrategyFactory, EntrySignal, ExitSignal, InMemorySignalSink, PositionStatus,
-    RolloverSignal, SignalSide, ShiftSignal, SignalRouter, SignalSink, SqliteSsuRepository,
-    SqliteStrategyPositionBook, Strategy, StrategyFactory, StrategyPosition,
-    StrategyPositionBook, StrategyRuntime, StrategyRuntimeHandle, StrategySignal,
-    SsuRepository, start_strategy_runtime,
+    BuiltinStrategyFactory, InMemorySignalSink, PositionStatus, SignalRouter, SignalSink,
+    SqliteSsuRepository, SqliteStrategyPositionBook, SqliteStrategyTradeContextStore,
+    SsuRepository, Strategy, StrategyFactory, StrategyPosition, StrategyPositionBook,
+    StrategyRuntime, StrategyRuntimeHandle, StrategyTradeContextStore, start_strategy_runtime,
+};
+pub use signal::{
+    InstrumentKind, PricePolicy, PricePolicyType, SignalSide, StrategySignal, StrategySignalType,
+    TradeAction, TradeInstruction, instrument_kind_label, parse_instrument_kind,
+    parse_price_policy, parse_price_policy_type, parse_signal_type, parse_trade_action,
+    price_policy_type_label, serialize_price_policy, signal_type_label, trade_action_label,
 };
 pub use timeframes::{SharedTimeframeEngine, TimeframeEngine};
 
@@ -89,4 +95,5 @@ pub struct StrategyContext {
     pub prices: Arc<dyn PriceStore>,
     pub timeframes: Arc<dyn TimeframeEngine>,
     pub strategy_positions: Arc<dyn StrategyPositionBook>,
+    pub trade_contexts: Arc<dyn StrategyTradeContextStore>,
 }
