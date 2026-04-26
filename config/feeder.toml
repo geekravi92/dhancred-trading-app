@@ -1,6 +1,7 @@
 [feeder]
 mode = "live"
-feed_brokers = ["DELTA", "FYERS"]
+# feed_brokers = ["DELTA", "FYERS"]
+feed_brokers = ["DELTA"]
 
 [brokers.delta]
 enabled = true
@@ -96,7 +97,8 @@ bind_addr = "127.0.0.1:8787"
 enabled = true
 time_ist = "08:00"
 weekdays_only = false
-brokers = ["DELTA", "FYERS"]
+# brokers = ["DELTA", "FYERS"]
+brokers = ["DELTA"]
 
 [channels]
 price_tick = true
