@@ -11,6 +11,7 @@ use crate::strategy::{
 #[derive(Debug, Default)]
 pub(crate) struct EmaPullbackScalpStrategy {
     settings: Mutex<BTreeMap<i64, EmaPullbackSettings>>,
+    indicator_states: Mutex<BTreeMap<IndicatorStateKey, IndicatorState>>,
     states: Mutex<BTreeMap<StateKey, SetupState>>,
 }
 
@@ -41,30 +42,23 @@ impl Strategy for EmaPullbackScalpStrategy {
             return Ok(Vec::new());
         };
 
-        let bars = ctx.timeframes.recent_bars(
-            &event.trigger_instrument,
-            settings.timeframe,
-            settings.lookback_bars,
-        );
-        if bars.len() < settings.min_required_bars() {
+        let Some(point) = self.advance_indicator_state(ctx, ssu, event, &settings, &closed_bar)?
+        else {
             return Ok(Vec::new());
-        }
+        };
 
-        // Step 3: Build price-only indicators from the bounded rolling lookback.
-        let series = IndicatorSeries::from_bars(&bars, &settings)?;
-
-        // Step 4: Existing legs are managed before any new setup is considered.
-        let mut exits = self.manage_open_positions(ctx, ssu, event, &settings, &bars, &series)?;
+        // Step 3: Existing legs are managed before any new setup is considered.
+        let mut exits =
+            self.manage_open_positions(ctx, ssu, event, &settings, &closed_bar, point.ema_slow)?;
         if !exits.is_empty() {
             return Ok(exits);
         }
 
-        // Step 5: Incrementally advance per-side setup state. Older warmup bars rebuild state,
-        // but only the current closed candle can emit a new live signal.
+        // Step 4: Incrementally advance per-side setup state.
         let entry_candidates =
-            self.advance_entry_states(ssu, event, &settings, &bars, closed_bar.end_at)?;
+            self.advance_entry_states(ctx, ssu, event, &settings, &closed_bar)?;
         for setup in entry_candidates {
-            // Step 6: Entry policy decides whether a valid setup can become a signal.
+            // Step 5: Entry policy decides whether a valid setup can become a signal.
             if !self.entry_policy_allows(ctx, ssu, event, &settings, &setup)? {
                 continue;
             }
@@ -85,11 +79,11 @@ impl Strategy for EmaPullbackScalpStrategy {
             });
 
             if settings.entry_policy == EntryPolicy::Pyramid {
-                // Step 7: Pyramid protection movement is internal strategy state only.
+                // Step 6: Pyramid protection movement is internal strategy state only.
                 self.adjust_existing_pyramid_stops(ctx, ssu, event, &settings, &setup, stop_price)?;
             }
 
-            // Step 8: Emit immutable signal envelope with one trade instruction for spot v1.
+            // Step 7: Emit immutable signal envelope with one trade instruction for spot v1.
             let mut entry_signal = StrategySignal::single_leg_entry(
                 ssu.ssu_id,
                 self.strategy_key(),
@@ -112,7 +106,7 @@ impl Strategy for EmaPullbackScalpStrategy {
                 Err(error) => return Err(error),
             };
 
-            // Step 9: Persist trade context so stops/targets survive process restart.
+            // Step 8: Persist trade context so stops/targets survive process restart.
             let metadata = setup.trade_context_metadata(
                 &entry_signal,
                 &position.position_id,
@@ -171,22 +165,86 @@ impl EmaPullbackScalpStrategy {
         Ok(settings)
     }
 
-    fn advance_entry_states(
+    fn advance_indicator_state(
         &self,
+        ctx: &StrategyContext,
         ssu: &SsuConfig,
         event: &PriceUpdated,
         settings: &EmaPullbackSettings,
-        bars: &[Bar],
-        current_closed_end: u64,
+        closed_bar: &Bar,
+    ) -> Result<Option<IndicatorPoint>, StrategyError> {
+        let state_key = IndicatorStateKey::new(ssu.ssu_id, &event.trigger_instrument);
+        let needs_catchup = self
+            .indicator_states
+            .lock()
+            .expect("ema pullback indicator lock poisoned")
+            .get(&state_key)
+            .is_none_or(|state| state.last_processed_closed_end.is_none());
+        let bars = if needs_catchup {
+            ctx.timeframes.recent_bars(
+                &event.trigger_instrument,
+                settings.timeframe,
+                settings.lookback_bars,
+            )
+        } else {
+            vec![closed_bar.clone()]
+        };
+
+        let mut latest = None;
+        let mut states = self
+            .indicator_states
+            .lock()
+            .expect("ema pullback indicator lock poisoned");
+        let state = states
+            .entry(state_key)
+            .or_insert_with(|| IndicatorState::new(settings));
+        for bar in bars {
+            if state
+                .last_processed_closed_end
+                .is_some_and(|end_at| bar.end_at <= end_at)
+            {
+                continue;
+            }
+            if let Some(point) = state.on_closed_bar(&bar)? {
+                latest = Some(point);
+            }
+        }
+
+        Ok(latest)
+    }
+
+    fn advance_entry_states(
+        &self,
+        ctx: &StrategyContext,
+        ssu: &SsuConfig,
+        event: &PriceUpdated,
+        settings: &EmaPullbackSettings,
+        closed_bar: &Bar,
     ) -> Result<Vec<DetectedSetup>, StrategyError> {
         let mut candidates = Vec::new();
-        let mut states = self
-            .states
-            .lock()
-            .expect("ema pullback state lock poisoned");
 
         for side in &settings.enabled_sides {
             let state_key = StateKey::new(ssu.ssu_id, &event.trigger_instrument, *side);
+            let needs_catchup = self
+                .states
+                .lock()
+                .expect("ema pullback state lock poisoned")
+                .get(&state_key)
+                .is_none_or(|state| state.last_processed_closed_end.is_none());
+            let bars = if needs_catchup {
+                ctx.timeframes.recent_bars(
+                    &event.trigger_instrument,
+                    settings.timeframe,
+                    settings.lookback_bars,
+                )
+            } else {
+                vec![closed_bar.clone()]
+            };
+
+            let mut states = self
+                .states
+                .lock()
+                .expect("ema pullback state lock poisoned");
             let state = states
                 .entry(state_key)
                 .or_insert_with(|| SetupState::new(settings));
@@ -197,11 +255,12 @@ impl EmaPullbackScalpStrategy {
                 {
                     continue;
                 }
-                let may_emit = bar.end_at == current_closed_end;
-                if let Some(setup) = state.on_closed_bar(bar, settings, *side, may_emit)? {
+                let may_emit = bar.end_at == closed_bar.end_at;
+                if let Some(setup) = state.on_closed_bar(&bar, settings, *side, may_emit)? {
                     candidates.push(setup);
                 }
             }
+            drop(states);
         }
 
         Ok(candidates)
@@ -213,16 +272,9 @@ impl EmaPullbackScalpStrategy {
         ssu: &SsuConfig,
         event: &PriceUpdated,
         settings: &EmaPullbackSettings,
-        bars: &[Bar],
-        series: &IndicatorSeries,
+        closed_bar: &Bar,
+        ema_slow: f64,
     ) -> Result<Vec<StrategySignal>, StrategyError> {
-        let Some(closed_bar) = bars.last() else {
-            return Ok(Vec::new());
-        };
-        let Some(ema_slow) = series.ema_slow.last().copied().flatten() else {
-            return Ok(Vec::new());
-        };
-
         let mut exits = Vec::new();
         let open_positions = ctx.strategy_positions.list_open_by_ssu(ssu.ssu_id)?;
         for position in open_positions
@@ -236,7 +288,6 @@ impl EmaPullbackScalpStrategy {
             let stop_price = required_f64(&metadata, "stop_price")?;
             let target_enabled = required_bool(&metadata, "target_enabled")?;
             let target_price = optional_f64(&metadata, "target_price");
-            let bars_since_entry = required_u64(&metadata, "bars_since_entry")?.saturating_add(1);
             let mut ema_fail_bars = required_u64(&metadata, "ema_fail_bars")?;
 
             let exit_reason = match position.side {
@@ -247,8 +298,6 @@ impl EmaPullbackScalpStrategy {
                         && target_price.is_some_and(|target| closed_bar.high >= target)
                     {
                         Some("target")
-                    } else if bars_since_entry >= settings.time_stop_bars as u64 {
-                        Some("time_stop")
                     } else {
                         if closed_bar.close < ema_slow {
                             ema_fail_bars = ema_fail_bars.saturating_add(1);
@@ -269,8 +318,6 @@ impl EmaPullbackScalpStrategy {
                         && target_price.is_some_and(|target| closed_bar.low <= target)
                     {
                         Some("target")
-                    } else if bars_since_entry >= settings.time_stop_bars as u64 {
-                        Some("time_stop")
                     } else {
                         if closed_bar.close > ema_slow {
                             ema_fail_bars = ema_fail_bars.saturating_add(1);
@@ -286,7 +333,6 @@ impl EmaPullbackScalpStrategy {
                 }
             };
 
-            metadata["bars_since_entry"] = serde_json::json!(bars_since_entry);
             metadata["ema_fail_bars"] = serde_json::json!(ema_fail_bars);
 
             if let Some(reason) = exit_reason {
@@ -508,6 +554,86 @@ impl EmaPullbackScalpStrategy {
     }
 }
 
+const WIDE_MAX: f64 = 1_000_000.0;
+
+#[derive(Clone, Copy, Debug)]
+struct NumericRange {
+    min: f64,
+    max: f64,
+}
+
+impl NumericRange {
+    fn new(min: f64, max: f64, field: &str, ssu_id: i64) -> Result<Self, StrategyError> {
+        if min.is_finite() && max.is_finite() && min >= 0.0 && max >= min {
+            Ok(Self { min, max })
+        } else {
+            Err(StrategyError::Config(format!(
+                "SSU {ssu_id} ema_pullback_scalp {field} range must satisfy 0 <= min <= max"
+            )))
+        }
+    }
+
+    fn contains(self, value: f64) -> bool {
+        value.is_finite() && value >= self.min && value <= self.max
+    }
+
+    fn allows_partial(self, value: Option<f64>) -> bool {
+        value.is_none_or(|value| value.is_finite() && value <= self.max)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CountRange {
+    min: usize,
+    max: usize,
+}
+
+impl CountRange {
+    fn new(min: usize, max: usize, field: &str, ssu_id: i64) -> Result<Self, StrategyError> {
+        if min > 0 && max >= min {
+            Ok(Self { min, max })
+        } else {
+            Err(StrategyError::Config(format!(
+                "SSU {ssu_id} ema_pullback_scalp {field} range must satisfy 0 < min <= max"
+            )))
+        }
+    }
+
+    fn contains(self, value: usize) -> bool {
+        value >= self.min && value <= self.max
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct RawFilters {
+    regime_fast_slope_atr: Option<RawRange>,
+    regime_ema_separation_atr: Option<RawRange>,
+    base_candle_count: Option<RawRange>,
+    base_range_atr: Option<RawRange>,
+    base_close_spread_atr: Option<RawRange>,
+    base_single_bar_range_atr: Option<RawRange>,
+    base_directional_efficiency: Option<RawRange>,
+    breakout_bar_range_atr: Option<RawRange>,
+    breakout_close_location: Option<RawRange>,
+    breakout_close_distance_atr: Option<RawRange>,
+    impulse_height_atr: Option<RawRange>,
+    impulse_bars: Option<RawRange>,
+    impulse_efficiency: Option<RawRange>,
+    pullback_ratio: Option<RawRange>,
+    pullback_bars: Option<RawRange>,
+    pullback_counter_efficiency: Option<RawRange>,
+    breakout_level_penetration_atr: Option<RawRange>,
+    trigger_close_location: Option<RawRange>,
+    trigger_break_distance_atr: Option<RawRange>,
+    entry_extension_atr: Option<RawRange>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct RawRange {
+    min: Option<f64>,
+    max: Option<f64>,
+}
+
 #[derive(Clone, Debug)]
 struct EmaPullbackSettings {
     timeframe: Timeframe,
@@ -518,33 +644,32 @@ struct EmaPullbackSettings {
     ema_slow_period: usize,
     atr_period: usize,
     regime_ema_slope_lookback_bars: usize,
-    regime_min_fast_slope_atr: f64,
-    regime_min_ema_separation_atr: f64,
-    base_window_bars: usize,
-    base_max_range_atr: f64,
-    base_max_close_spread_atr: f64,
-    base_max_single_bar_range_atr: f64,
-    base_max_directional_efficiency: f64,
+    regime_fast_slope_atr: NumericRange,
+    regime_ema_separation_atr: NumericRange,
+    base_candle_count: CountRange,
+    base_range_atr: NumericRange,
+    base_close_spread_atr: NumericRange,
+    base_single_bar_range_atr: NumericRange,
+    base_directional_efficiency: NumericRange,
     breakout_buffer_atr: f64,
-    breakout_min_bar_range_atr: f64,
-    breakout_min_close_location: f64,
-    impulse_min_height_atr: f64,
-    impulse_max_bars: usize,
-    impulse_min_efficiency: f64,
-    pullback_min_ratio: f64,
-    pullback_max_ratio: f64,
-    pullback_min_bars: usize,
-    pullback_max_bars: usize,
-    pullback_max_counter_efficiency: f64,
+    breakout_bar_range_atr: NumericRange,
+    breakout_close_location: NumericRange,
+    breakout_close_distance_atr: NumericRange,
+    impulse_height_atr: NumericRange,
+    impulse_bars: CountRange,
+    impulse_efficiency: NumericRange,
+    pullback_ratio: NumericRange,
+    pullback_bars: CountRange,
+    pullback_counter_efficiency: NumericRange,
     ema_zone_buffer_atr: f64,
-    max_breakout_level_penetration_atr: f64,
+    breakout_level_penetration_atr: NumericRange,
     trigger_break_lookback_bars: usize,
     trigger_buffer_atr: f64,
-    trigger_min_close_location: f64,
-    max_entry_extension_atr: f64,
+    trigger_close_location: NumericRange,
+    trigger_break_distance_atr: NumericRange,
+    entry_extension_atr: NumericRange,
     stop_buffer_atr: f64,
     target_r_multiple: Option<f64>,
-    time_stop_bars: usize,
     exit_on_ema_fail_bars: usize,
     pyramid_min_profit_r_before_add: f64,
     pyramid_stop_adjustment: PyramidStopAdjustment,
@@ -592,13 +717,13 @@ impl EmaPullbackSettings {
             stop_buffer_atr: Option<f64>,
             target_enabled: Option<bool>,
             target_r_multiple: Option<f64>,
-            time_stop_bars: Option<usize>,
             exit_on_ema_fail_bars: Option<usize>,
             pyramid_min_profit_r_before_add: Option<f64>,
             pyramid_stop_adjustment: Option<String>,
             pyramid_require_fresh_base_after_last_entry: Option<bool>,
             pyramid_min_breakout_level_distance_atr: Option<f64>,
             pyramid_max_active_legs: Option<u32>,
+            filters: Option<RawFilters>,
         }
 
         let raw: Raw = serde_json::from_str(&ssu.params_json).map_err(|error| {
@@ -665,6 +790,7 @@ impl EmaPullbackSettings {
         } else {
             (0.0, PyramidStopAdjustment::None, false, 0.0, 0)
         };
+        let filters = raw.filters.clone().unwrap_or_default();
         let settings = Self {
             timeframe,
             enabled_sides,
@@ -678,35 +804,53 @@ impl EmaPullbackSettings {
                 "regime_ema_slope_lookback_bars",
                 ssu.ssu_id,
             )?,
-            regime_min_fast_slope_atr: require_non_negative(
+            regime_fast_slope_atr: numeric_range_from_filter_or_legacy(
+                filters.regime_fast_slope_atr,
+                "filters.regime_fast_slope_atr",
                 raw.regime_min_fast_slope_atr,
-                "regime_min_fast_slope_atr",
+                Some(WIDE_MAX),
                 ssu.ssu_id,
             )?,
-            regime_min_ema_separation_atr: require_non_negative(
+            regime_ema_separation_atr: numeric_range_from_filter_or_legacy(
+                filters.regime_ema_separation_atr,
+                "filters.regime_ema_separation_atr",
                 raw.regime_min_ema_separation_atr,
-                "regime_min_ema_separation_atr",
+                Some(WIDE_MAX),
                 ssu.ssu_id,
             )?,
-            base_window_bars: require(raw.base_window_bars, "base_window_bars", ssu.ssu_id)?,
-            base_max_range_atr: require_non_negative(
+            base_candle_count: count_range_from_filter_or_legacy(
+                filters.base_candle_count,
+                "filters.base_candle_count",
+                raw.base_window_bars,
+                Some(usize::MAX / 4),
+                ssu.ssu_id,
+            )?,
+            base_range_atr: numeric_range_from_filter_or_legacy(
+                filters.base_range_atr,
+                "filters.base_range_atr",
+                Some(0.0),
                 raw.base_max_range_atr,
-                "base_max_range_atr",
                 ssu.ssu_id,
             )?,
-            base_max_close_spread_atr: require_non_negative(
+            base_close_spread_atr: numeric_range_from_filter_or_legacy(
+                filters.base_close_spread_atr,
+                "filters.base_close_spread_atr",
+                Some(0.0),
                 raw.base_max_close_spread_atr,
-                "base_max_close_spread_atr",
                 ssu.ssu_id,
             )?,
-            base_max_single_bar_range_atr: require_non_negative(
+            base_single_bar_range_atr: numeric_range_from_filter_or_legacy(
+                filters.base_single_bar_range_atr,
+                "filters.base_single_bar_range_atr",
+                Some(0.0),
                 raw.base_max_single_bar_range_atr,
-                "base_max_single_bar_range_atr",
                 ssu.ssu_id,
             )?,
-            base_max_directional_efficiency: require_non_negative(
+            base_directional_efficiency: numeric_range_from_filter_or_legacy(
+                filters.base_directional_efficiency,
+                "filters.base_directional_efficiency",
+                Some(0.0),
                 raw.base_max_directional_efficiency,
-                "base_max_directional_efficiency",
                 ssu.ssu_id,
             )?,
             breakout_buffer_atr: require_non_negative(
@@ -714,42 +858,67 @@ impl EmaPullbackSettings {
                 "breakout_buffer_atr",
                 ssu.ssu_id,
             )?,
-            breakout_min_bar_range_atr: require_non_negative(
+            breakout_bar_range_atr: numeric_range_from_filter_or_legacy(
+                filters.breakout_bar_range_atr,
+                "filters.breakout_bar_range_atr",
                 raw.breakout_min_bar_range_atr,
-                "breakout_min_bar_range_atr",
+                Some(WIDE_MAX),
                 ssu.ssu_id,
             )?,
-            breakout_min_close_location: require_ratio(
+            breakout_close_location: ratio_range_from_filter_or_legacy(
+                filters.breakout_close_location,
+                "filters.breakout_close_location",
                 raw.breakout_min_close_location,
-                "breakout_min_close_location",
+                Some(1.0),
                 ssu.ssu_id,
             )?,
-            impulse_min_height_atr: require_non_negative(
+            breakout_close_distance_atr: numeric_range_from_filter_or_legacy(
+                filters.breakout_close_distance_atr,
+                "filters.breakout_close_distance_atr",
+                Some(0.0),
+                Some(WIDE_MAX),
+                ssu.ssu_id,
+            )?,
+            impulse_height_atr: numeric_range_from_filter_or_legacy(
+                filters.impulse_height_atr,
+                "filters.impulse_height_atr",
                 raw.impulse_min_height_atr,
-                "impulse_min_height_atr",
+                Some(WIDE_MAX),
                 ssu.ssu_id,
             )?,
-            impulse_max_bars: require(raw.impulse_max_bars, "impulse_max_bars", ssu.ssu_id)?,
-            impulse_min_efficiency: require_non_negative(
+            impulse_bars: count_range_from_filter_or_legacy(
+                filters.impulse_bars,
+                "filters.impulse_bars",
+                Some(1),
+                raw.impulse_max_bars.map(|value| value.saturating_add(1)),
+                ssu.ssu_id,
+            )?,
+            impulse_efficiency: numeric_range_from_filter_or_legacy(
+                filters.impulse_efficiency,
+                "filters.impulse_efficiency",
                 raw.impulse_min_efficiency,
-                "impulse_min_efficiency",
+                Some(WIDE_MAX),
                 ssu.ssu_id,
             )?,
-            pullback_min_ratio: require_non_negative(
+            pullback_ratio: numeric_range_from_filter_or_legacy(
+                filters.pullback_ratio,
+                "filters.pullback_ratio",
                 raw.pullback_min_ratio,
-                "pullback_min_ratio",
-                ssu.ssu_id,
-            )?,
-            pullback_max_ratio: require_non_negative(
                 raw.pullback_max_ratio,
-                "pullback_max_ratio",
                 ssu.ssu_id,
             )?,
-            pullback_min_bars: require(raw.pullback_min_bars, "pullback_min_bars", ssu.ssu_id)?,
-            pullback_max_bars: require(raw.pullback_max_bars, "pullback_max_bars", ssu.ssu_id)?,
-            pullback_max_counter_efficiency: require_non_negative(
+            pullback_bars: count_range_from_filter_or_legacy(
+                filters.pullback_bars,
+                "filters.pullback_bars",
+                raw.pullback_min_bars,
+                raw.pullback_max_bars,
+                ssu.ssu_id,
+            )?,
+            pullback_counter_efficiency: numeric_range_from_filter_or_legacy(
+                filters.pullback_counter_efficiency,
+                "filters.pullback_counter_efficiency",
+                Some(0.0),
                 raw.pullback_max_counter_efficiency,
-                "pullback_max_counter_efficiency",
                 ssu.ssu_id,
             )?,
             ema_zone_buffer_atr: require_non_negative(
@@ -757,9 +926,11 @@ impl EmaPullbackSettings {
                 "ema_zone_buffer_atr",
                 ssu.ssu_id,
             )?,
-            max_breakout_level_penetration_atr: require_non_negative(
+            breakout_level_penetration_atr: numeric_range_from_filter_or_legacy(
+                filters.breakout_level_penetration_atr,
+                "filters.breakout_level_penetration_atr",
+                Some(0.0),
                 raw.max_breakout_level_penetration_atr,
-                "max_breakout_level_penetration_atr",
                 ssu.ssu_id,
             )?,
             trigger_break_lookback_bars: require(
@@ -772,14 +943,25 @@ impl EmaPullbackSettings {
                 "trigger_buffer_atr",
                 ssu.ssu_id,
             )?,
-            trigger_min_close_location: require_ratio(
+            trigger_close_location: ratio_range_from_filter_or_legacy(
+                filters.trigger_close_location,
+                "filters.trigger_close_location",
                 raw.trigger_min_close_location,
-                "trigger_min_close_location",
+                Some(1.0),
                 ssu.ssu_id,
             )?,
-            max_entry_extension_atr: require_non_negative(
+            trigger_break_distance_atr: numeric_range_from_filter_or_legacy(
+                filters.trigger_break_distance_atr,
+                "filters.trigger_break_distance_atr",
+                Some(0.0),
+                Some(WIDE_MAX),
+                ssu.ssu_id,
+            )?,
+            entry_extension_atr: numeric_range_from_filter_or_legacy(
+                filters.entry_extension_atr,
+                "filters.entry_extension_atr",
+                Some(0.0),
                 raw.max_entry_extension_atr,
-                "max_entry_extension_atr",
                 ssu.ssu_id,
             )?,
             stop_buffer_atr: require_non_negative(
@@ -796,7 +978,6 @@ impl EmaPullbackSettings {
             } else {
                 None
             },
-            time_stop_bars: require(raw.time_stop_bars, "time_stop_bars", ssu.ssu_id)?,
             exit_on_ema_fail_bars: require(
                 raw.exit_on_ema_fail_bars,
                 "exit_on_ema_fail_bars",
@@ -820,22 +1001,16 @@ impl EmaPullbackSettings {
         }
         if self.atr_period == 0
             || self.regime_ema_slope_lookback_bars == 0
-            || self.base_window_bars <= 1
-            || self.impulse_max_bars == 0
-            || self.pullback_min_bars == 0
             || self.trigger_break_lookback_bars == 0
-            || self.time_stop_bars == 0
             || self.exit_on_ema_fail_bars == 0
         {
             return Err(StrategyError::Config(format!(
                 "SSU {ssu_id} ema_pullback_scalp bar counts must be positive"
             )));
         }
-        if self.pullback_max_bars < self.pullback_min_bars
-            || self.pullback_max_ratio <= self.pullback_min_ratio
-        {
+        if self.base_candle_count.min <= 1 {
             return Err(StrategyError::Config(format!(
-                "SSU {ssu_id} ema_pullback_scalp pullback bounds are invalid"
+                "SSU {ssu_id} ema_pullback_scalp base_candle_count.min must be greater than 1"
             )));
         }
         if self.lookback_bars < self.min_required_bars() {
@@ -851,9 +1026,9 @@ impl EmaPullbackSettings {
     fn min_required_bars(&self) -> usize {
         self.ema_slow_period.max(self.atr_period)
             + self.regime_ema_slope_lookback_bars
-            + self.base_window_bars
-            + self.impulse_max_bars
-            + self.pullback_max_bars
+            + self.base_candle_count.min
+            + self.impulse_bars.max
+            + self.pullback_bars.max
             + self.trigger_break_lookback_bars
             + 5
     }
@@ -872,6 +1047,41 @@ enum PyramidStopAdjustment {
     Breakeven,
     LatestEntrySl,
     BetterOfBreakevenOrLatestEntrySl,
+}
+
+#[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+struct IndicatorStateKey {
+    ssu_id: i64,
+    instrument: String,
+}
+
+impl IndicatorStateKey {
+    fn new(ssu_id: i64, instrument: &str) -> Self {
+        Self {
+            ssu_id,
+            instrument: instrument.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct IndicatorState {
+    last_processed_closed_end: Option<u64>,
+    indicators: IncrementalIndicators,
+}
+
+impl IndicatorState {
+    fn new(settings: &EmaPullbackSettings) -> Self {
+        Self {
+            last_processed_closed_end: None,
+            indicators: IncrementalIndicators::new(settings),
+        }
+    }
+
+    fn on_closed_bar(&mut self, bar: &Bar) -> Result<Option<IndicatorPoint>, StrategyError> {
+        self.last_processed_closed_end = Some(bar.end_at);
+        self.indicators.update(bar)
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
@@ -960,7 +1170,7 @@ impl SetupState {
 
         if base.is_breakout(bar, point.atr, settings, side) {
             self.setup = Some(SetupTracker::new(
-                BaseSnapshot::from_candidate(&base, side),
+                BaseSnapshot::from_candidate(&base, side, point.atr),
                 bar,
                 side,
                 point.atr,
@@ -1149,7 +1359,7 @@ impl BaseCandidate {
         let range = bar.high - bar.low;
         if range.is_finite()
             && range >= 0.0
-            && range / atr <= settings.base_max_single_bar_range_atr
+            && settings.base_single_bar_range_atr.contains(range / atr)
         {
             Some(Self::start(bar))
         } else {
@@ -1197,17 +1407,24 @@ impl BaseCandidate {
     }
 
     fn is_ready(&self, settings: &EmaPullbackSettings, atr: f64) -> bool {
-        self.candle_count >= settings.base_window_bars && self.is_structurally_valid(settings, atr)
+        settings.base_candle_count.contains(self.candle_count)
+            && self.is_structurally_valid(settings, atr)
     }
 
     fn is_structurally_valid(&self, settings: &EmaPullbackSettings, atr: f64) -> bool {
         if !atr.is_finite() || atr <= 0.0 {
             return false;
         }
-        self.range() / atr <= settings.base_max_range_atr
-            && (self.close_high - self.close_low) / atr <= settings.base_max_close_spread_atr
-            && self.max_single_bar_range / atr <= settings.base_max_single_bar_range_atr
-            && self.directional_efficiency() <= settings.base_max_directional_efficiency
+        settings.base_range_atr.contains(self.range() / atr)
+            && settings
+                .base_close_spread_atr
+                .contains((self.close_high - self.close_low) / atr)
+            && settings
+                .base_single_bar_range_atr
+                .contains(self.max_single_bar_range / atr)
+            && settings
+                .base_directional_efficiency
+                .contains(self.directional_efficiency())
     }
 
     fn breakout_level(&self, side: SignalSide) -> f64 {
@@ -1239,14 +1456,24 @@ struct BaseSnapshot {
     start_at: u64,
     end_at: u64,
     breakout_level: f64,
+    candle_count: usize,
+    range_atr: f64,
+    close_spread_atr: f64,
+    max_single_bar_range_atr: f64,
+    directional_efficiency: f64,
 }
 
 impl BaseSnapshot {
-    fn from_candidate(candidate: &BaseCandidate, side: SignalSide) -> Self {
+    fn from_candidate(candidate: &BaseCandidate, side: SignalSide, atr: f64) -> Self {
         Self {
             start_at: candidate.start_at,
             end_at: candidate.end_at,
             breakout_level: candidate.breakout_level(side),
+            candle_count: candidate.candle_count,
+            range_atr: candidate.range() / atr,
+            close_spread_atr: (candidate.close_high - candidate.close_low) / atr,
+            max_single_bar_range_atr: candidate.max_single_bar_range / atr,
+            directional_efficiency: candidate.directional_efficiency(),
         }
     }
 }
@@ -1258,6 +1485,9 @@ struct SetupTracker {
     phase: SetupPhase,
     breakout_bar_end_at: u64,
     breakout_atr: f64,
+    breakout_bar_range_atr: f64,
+    breakout_close_location: f64,
+    breakout_close_distance_atr: f64,
     swing_start_price: f64,
     swing_extreme_price: f64,
     swing_extreme_bar_end_at: u64,
@@ -1278,12 +1508,19 @@ impl SetupTracker {
             SignalSide::Long => breakout_bar.high,
             SignalSide::Short => breakout_bar.low,
         };
+        let breakout_close_distance_atr = match side {
+            SignalSide::Long => (breakout_bar.close - base.breakout_level) / breakout_atr,
+            SignalSide::Short => (base.breakout_level - breakout_bar.close) / breakout_atr,
+        };
         Self {
             base,
             side,
             phase: SetupPhase::Impulse,
             breakout_bar_end_at: breakout_bar.end_at,
             breakout_atr,
+            breakout_bar_range_atr: (breakout_bar.high - breakout_bar.low) / breakout_atr,
+            breakout_close_location: close_location(breakout_bar, side).unwrap_or(0.0),
+            breakout_close_distance_atr,
             swing_start_price,
             swing_extreme_price,
             swing_extreme_bar_end_at: breakout_bar.end_at,
@@ -1326,7 +1563,7 @@ impl SetupTracker {
         if self.makes_new_swing_extreme(bar) {
             self.impulse_bars.push(bar.clone());
             self.update_swing_extreme(bar);
-            if self.impulse_bars.len() > settings.impulse_max_bars.saturating_add(1) {
+            if self.impulse_bars.len() > settings.impulse_bars.max {
                 SetupAdvance::Invalid
             } else {
                 SetupAdvance::None
@@ -1347,28 +1584,27 @@ impl SetupTracker {
     ) -> SetupAdvance {
         self.pullback_bars.push(bar.clone());
         self.update_pullback_extreme(bar);
-        if self.pullback_bars.len() > settings.pullback_max_bars {
+        if self.pullback_bars.len() > settings.pullback_bars.max {
             return SetupAdvance::Invalid;
         }
+        let pullback_ratio = self.pullback_ratio();
         if !breakout_level_respected(
             self.pullback_extreme_price
                 .expect("pullback extreme exists after push"),
             self.base.breakout_level,
             self.side,
             point.atr,
-            settings.max_breakout_level_penetration_atr,
+            settings.breakout_level_penetration_atr,
         ) {
             return SetupAdvance::Invalid;
         }
-        if self
-            .pullback_ratio()
-            .is_some_and(|ratio| ratio > settings.pullback_max_ratio)
-        {
+        if !settings.pullback_ratio.allows_partial(pullback_ratio) {
             return SetupAdvance::Invalid;
         }
-        if self.pullback_bars.len() >= settings.pullback_min_bars
-            && pullback_counter_efficiency(&self.pullback_bars)
-                > settings.pullback_max_counter_efficiency
+        if self.pullback_bars.len() >= settings.pullback_bars.min
+            && !settings
+                .pullback_counter_efficiency
+                .contains(pullback_counter_efficiency(&self.pullback_bars))
         {
             return SetupAdvance::Invalid;
         }
@@ -1394,17 +1630,17 @@ impl SetupTracker {
         point: &IndicatorPoint,
         settings: &EmaPullbackSettings,
     ) -> Option<DetectedSetup> {
-        if self.pullback_bars.len() < settings.pullback_min_bars
+        if !settings.pullback_bars.contains(self.pullback_bars.len())
             || !self.pullback_touched_ema_zone
             || !regime_valid_point(point, settings, self.side)
         {
             return None;
         }
         let pullback_ratio = self.pullback_ratio()?;
-        if pullback_ratio < settings.pullback_min_ratio
-            || pullback_ratio > settings.pullback_max_ratio
-            || pullback_counter_efficiency(&self.pullback_bars)
-                > settings.pullback_max_counter_efficiency
+        if !settings.pullback_ratio.contains(pullback_ratio)
+            || !settings
+                .pullback_counter_efficiency
+                .contains(pullback_counter_efficiency(&self.pullback_bars))
         {
             return None;
         }
@@ -1419,10 +1655,17 @@ impl SetupTracker {
         ) {
             return None;
         }
-        Some(self.detected_setup(trigger_bar, point.atr, pullback_ratio))
+        Some(self.detected_setup(trigger_bar, point, settings, pullback_ratio))
     }
 
-    fn detected_setup(&self, trigger_bar: &Bar, atr: f64, pullback_ratio: f64) -> DetectedSetup {
+    fn detected_setup(
+        &self,
+        trigger_bar: &Bar,
+        point: &IndicatorPoint,
+        settings: &EmaPullbackSettings,
+        pullback_ratio: f64,
+    ) -> DetectedSetup {
+        let atr = point.atr;
         let pullback_extreme_price = self
             .pullback_extreme_price
             .expect("detected setup requires pullback extreme");
@@ -1431,6 +1674,23 @@ impl SetupTracker {
             .expect("detected setup requires pullback extreme time");
         let impulse_height = self.impulse_height();
         let impulse_atr = impulse_height / self.breakout_atr;
+        let trigger_reference = trigger_break_reference(
+            &self.pullback_bars,
+            settings.trigger_break_lookback_bars,
+            self.side,
+        );
+        let trigger_break_distance_atr = match self.side {
+            SignalSide::Long => (trigger_bar.close - trigger_reference) / atr,
+            SignalSide::Short => (trigger_reference - trigger_bar.close) / atr,
+        };
+        let entry_extension_atr = match self.side {
+            SignalSide::Long => (trigger_bar.close - point.ema_fast.max(point.ema_slow)) / atr,
+            SignalSide::Short => (point.ema_fast.min(point.ema_slow) - trigger_bar.close) / atr,
+        };
+        let breakout_level_penetration_atr = match self.side {
+            SignalSide::Long => (self.base.breakout_level - pullback_extreme_price).max(0.0) / atr,
+            SignalSide::Short => (pullback_extreme_price - self.base.breakout_level).max(0.0) / atr,
+        };
         DetectedSetup {
             side: self.side,
             setup_id: format!(
@@ -1446,17 +1706,36 @@ impl SetupTracker {
             ),
             base_start_at: self.base.start_at,
             base_end_at: self.base.end_at,
+            base_candle_count: self.base.candle_count,
+            base_range_atr: self.base.range_atr,
+            base_close_spread_atr: self.base.close_spread_atr,
+            base_max_single_bar_range_atr: self.base.max_single_bar_range_atr,
+            base_directional_efficiency: self.base.directional_efficiency,
             breakout_bar_end_at: self.breakout_bar_end_at,
             breakout_level: self.base.breakout_level,
+            breakout_bar_range_atr: self.breakout_bar_range_atr,
+            breakout_close_location: self.breakout_close_location,
+            breakout_close_distance_atr: self.breakout_close_distance_atr,
             swing_extreme_bar_end_at: self.swing_extreme_bar_end_at,
             pullback_extreme_bar_end_at,
             swing_start_price: self.swing_start_price,
             swing_extreme_price: self.swing_extreme_price,
             pullback_extreme_price,
             impulse_height,
+            impulse_bars: self.impulse_bars.len(),
+            impulse_efficiency: pullback_counter_efficiency(&self.impulse_bars),
             pullback_ratio,
+            pullback_bars: self.pullback_bars.len(),
+            pullback_counter_efficiency: pullback_counter_efficiency(&self.pullback_bars),
+            breakout_level_penetration_atr,
             impulse_atr,
             atr,
+            trigger_bar_range_atr: (trigger_bar.high - trigger_bar.low) / atr,
+            trigger_close_location: close_location(trigger_bar, self.side).unwrap_or(0.0),
+            trigger_break_distance_atr,
+            entry_extension_atr,
+            ema_fast_slope_atr: (point.ema_fast - point.ema_fast_past) / atr,
+            ema_separation_atr: (point.ema_fast - point.ema_slow).abs() / atr,
             trigger_close: trigger_bar.close,
         }
     }
@@ -1511,8 +1790,13 @@ impl SetupTracker {
     fn impulse_valid(&self, settings: &EmaPullbackSettings) -> bool {
         let impulse_height = self.impulse_height();
         impulse_height > 0.0
-            && impulse_height / self.breakout_atr >= settings.impulse_min_height_atr
-            && pullback_counter_efficiency(&self.impulse_bars) >= settings.impulse_min_efficiency
+            && settings
+                .impulse_height_atr
+                .contains(impulse_height / self.breakout_atr)
+            && settings.impulse_bars.contains(self.impulse_bars.len())
+            && settings
+                .impulse_efficiency
+                .contains(pullback_counter_efficiency(&self.impulse_bars))
     }
 
     fn impulse_height(&self) -> f64 {
@@ -1555,17 +1839,25 @@ fn regime_valid_point(
     side: SignalSide,
 ) -> bool {
     let slope_atr = (point.ema_fast - point.ema_fast_past) / point.atr;
+    let directional_slope_atr = match side {
+        SignalSide::Long => slope_atr,
+        SignalSide::Short => -slope_atr,
+    };
     let separation_atr = (point.ema_fast - point.ema_slow).abs() / point.atr;
     match side {
         SignalSide::Long => {
             point.ema_fast > point.ema_slow
-                && slope_atr >= settings.regime_min_fast_slope_atr
-                && separation_atr >= settings.regime_min_ema_separation_atr
+                && settings
+                    .regime_fast_slope_atr
+                    .contains(directional_slope_atr)
+                && settings.regime_ema_separation_atr.contains(separation_atr)
         }
         SignalSide::Short => {
             point.ema_fast < point.ema_slow
-                && slope_atr <= -settings.regime_min_fast_slope_atr
-                && separation_atr >= settings.regime_min_ema_separation_atr
+                && settings
+                    .regime_fast_slope_atr
+                    .contains(directional_slope_atr)
+                && settings.regime_ema_separation_atr.contains(separation_atr)
         }
     }
 }
@@ -1575,35 +1867,41 @@ fn pullback_counter_efficiency(bars: &[Bar]) -> f64 {
 }
 
 #[derive(Clone, Debug)]
-struct IndicatorSeries {
-    ema_slow: Vec<Option<f64>>,
-}
-
-impl IndicatorSeries {
-    fn from_bars(bars: &[Bar], settings: &EmaPullbackSettings) -> Result<Self, StrategyError> {
-        Ok(Self {
-            ema_slow: ema_series(bars, settings.ema_slow_period)?,
-        })
-    }
-}
-
-#[derive(Clone, Debug)]
 struct DetectedSetup {
     side: SignalSide,
     setup_id: String,
     base_start_at: u64,
     base_end_at: u64,
+    base_candle_count: usize,
+    base_range_atr: f64,
+    base_close_spread_atr: f64,
+    base_max_single_bar_range_atr: f64,
+    base_directional_efficiency: f64,
     breakout_bar_end_at: u64,
     breakout_level: f64,
+    breakout_bar_range_atr: f64,
+    breakout_close_location: f64,
+    breakout_close_distance_atr: f64,
     swing_extreme_bar_end_at: u64,
     pullback_extreme_bar_end_at: u64,
     swing_start_price: f64,
     swing_extreme_price: f64,
     pullback_extreme_price: f64,
     impulse_height: f64,
+    impulse_bars: usize,
+    impulse_efficiency: f64,
     pullback_ratio: f64,
+    pullback_bars: usize,
+    pullback_counter_efficiency: f64,
+    breakout_level_penetration_atr: f64,
     impulse_atr: f64,
     atr: f64,
+    trigger_bar_range_atr: f64,
+    trigger_close_location: f64,
+    trigger_break_distance_atr: f64,
+    entry_extension_atr: f64,
+    ema_fast_slope_atr: f64,
+    ema_separation_atr: f64,
     trigger_close: f64,
 }
 
@@ -1640,12 +1938,33 @@ impl DetectedSetup {
             "target_price": target_price,
             "base_start_at": self.base_start_at,
             "base_end_at": self.base_end_at,
+            "base_candle_count": self.base_candle_count,
+            "base_range_atr": self.base_range_atr,
+            "base_close_spread_atr": self.base_close_spread_atr,
+            "base_max_single_bar_range_atr": self.base_max_single_bar_range_atr,
+            "base_directional_efficiency": self.base_directional_efficiency,
             "breakout_level": self.breakout_level,
+            "breakout_bar_end_at": self.breakout_bar_end_at,
+            "breakout_bar_range_atr": self.breakout_bar_range_atr,
+            "breakout_close_location": self.breakout_close_location,
+            "breakout_close_distance_atr": self.breakout_close_distance_atr,
             "swing_extreme_bar_end_at": self.swing_extreme_bar_end_at,
             "pullback_extreme_bar_end_at": self.pullback_extreme_bar_end_at,
             "impulse_height": self.impulse_height,
+            "impulse_bars": self.impulse_bars,
+            "impulse_efficiency": self.impulse_efficiency,
             "pullback_ratio": self.pullback_ratio,
+            "pullback_bars": self.pullback_bars,
+            "pullback_counter_efficiency": self.pullback_counter_efficiency,
+            "breakout_level_penetration_atr": self.breakout_level_penetration_atr,
             "impulse_atr": self.impulse_atr,
+            "atr": self.atr,
+            "trigger_bar_range_atr": self.trigger_bar_range_atr,
+            "trigger_close_location": self.trigger_close_location,
+            "trigger_break_distance_atr": self.trigger_break_distance_atr,
+            "entry_extension_atr": self.entry_extension_atr,
+            "ema_fast_slope_atr": self.ema_fast_slope_atr,
+            "ema_separation_atr": self.ema_separation_atr,
         })
     }
 
@@ -1679,8 +1998,7 @@ impl DetectedSetup {
             "swing_start_price": self.swing_start_price,
             "swing_extreme": self.swing_extreme_price,
             "pullback_extreme": self.pullback_extreme_price,
-            "ema_fail_bars": 0_u64,
-            "bars_since_entry": 0_u64
+            "ema_fail_bars": 0_u64
         })
     }
 }
@@ -1693,13 +2011,23 @@ fn breakout_valid(
     atr: f64,
 ) -> bool {
     let bar_range_atr = (bar.high - bar.low) / atr;
-    if bar_range_atr < settings.breakout_min_bar_range_atr {
+    if !settings.breakout_bar_range_atr.contains(bar_range_atr) {
         return false;
     }
     let Some(close_location) = close_location(bar, side) else {
         return false;
     };
-    if close_location < settings.breakout_min_close_location {
+    if !settings.breakout_close_location.contains(close_location) {
+        return false;
+    }
+    let close_distance_atr = match side {
+        SignalSide::Long => (bar.close - breakout_level) / atr,
+        SignalSide::Short => (breakout_level - bar.close) / atr,
+    };
+    if !settings
+        .breakout_close_distance_atr
+        .contains(close_distance_atr)
+    {
         return false;
     }
     match side {
@@ -1724,25 +2052,43 @@ fn trigger_valid(
     let Some(close_location) = close_location(trigger_bar, side) else {
         return false;
     };
-    if close_location < settings.trigger_min_close_location {
+    if !settings.trigger_close_location.contains(close_location) {
         return false;
     }
     match side {
         SignalSide::Long => {
             let reference = recent.iter().map(|bar| bar.high).fold(f64::MIN, f64::max);
             let extension = trigger_bar.close - ema_fast.max(ema_slow);
+            let break_distance_atr = (trigger_bar.close - reference) / atr;
             trigger_bar.close > reference + settings.trigger_buffer_atr * atr
-                && extension / atr <= settings.max_entry_extension_atr
+                && settings
+                    .trigger_break_distance_atr
+                    .contains(break_distance_atr)
+                && settings.entry_extension_atr.contains(extension / atr)
         }
         SignalSide::Short => {
             let reference = recent.iter().map(|bar| bar.low).fold(f64::MAX, f64::min);
             let extension = ema_fast.min(ema_slow) - trigger_bar.close;
+            let break_distance_atr = (reference - trigger_bar.close) / atr;
             trigger_bar.close < reference - settings.trigger_buffer_atr * atr
-                && extension / atr <= settings.max_entry_extension_atr
+                && settings
+                    .trigger_break_distance_atr
+                    .contains(break_distance_atr)
+                && settings.entry_extension_atr.contains(extension / atr)
         }
     }
 }
 
+fn trigger_break_reference(pullback_bars: &[Bar], lookback_bars: usize, side: SignalSide) -> f64 {
+    let start = pullback_bars.len().saturating_sub(lookback_bars);
+    let recent = &pullback_bars[start..];
+    match side {
+        SignalSide::Long => recent.iter().map(|bar| bar.high).fold(f64::MIN, f64::max),
+        SignalSide::Short => recent.iter().map(|bar| bar.low).fold(f64::MAX, f64::min),
+    }
+}
+
+#[cfg(test)]
 fn ema_series(bars: &[Bar], period: usize) -> Result<Vec<Option<f64>>, StrategyError> {
     if period == 0 {
         return Err(StrategyError::Config(
@@ -1795,12 +2141,13 @@ fn breakout_level_respected(
     breakout_level: f64,
     side: SignalSide,
     atr: f64,
-    penetration_atr: f64,
+    penetration_atr: NumericRange,
 ) -> bool {
-    match side {
-        SignalSide::Long => pullback_extreme >= breakout_level - penetration_atr * atr,
-        SignalSide::Short => pullback_extreme <= breakout_level + penetration_atr * atr,
-    }
+    let value = match side {
+        SignalSide::Long => (breakout_level - pullback_extreme).max(0.0) / atr,
+        SignalSide::Short => (pullback_extreme - breakout_level).max(0.0) / atr,
+    };
+    penetration_atr.contains(value)
 }
 
 fn close_location(bar: &Bar, side: SignalSide) -> Option<f64> {
@@ -1828,6 +2175,80 @@ fn require<T>(value: Option<T>, field: &str, ssu_id: i64) -> Result<T, StrategyE
     })
 }
 
+fn numeric_range_from_filter_or_legacy(
+    range: Option<RawRange>,
+    field: &str,
+    legacy_min: Option<f64>,
+    legacy_max: Option<f64>,
+    ssu_id: i64,
+) -> Result<NumericRange, StrategyError> {
+    if let Some(range) = range {
+        return NumericRange::new(
+            require(range.min, &format!("{field}.min"), ssu_id)?,
+            require(range.max, &format!("{field}.max"), ssu_id)?,
+            field,
+            ssu_id,
+        );
+    }
+    NumericRange::new(
+        require(legacy_min, &format!("{field}.min"), ssu_id)?,
+        require(legacy_max, &format!("{field}.max"), ssu_id)?,
+        field,
+        ssu_id,
+    )
+}
+
+fn ratio_range_from_filter_or_legacy(
+    range: Option<RawRange>,
+    field: &str,
+    legacy_min: Option<f64>,
+    legacy_max: Option<f64>,
+    ssu_id: i64,
+) -> Result<NumericRange, StrategyError> {
+    let range = numeric_range_from_filter_or_legacy(range, field, legacy_min, legacy_max, ssu_id)?;
+    if range.max <= 1.0 {
+        Ok(range)
+    } else {
+        Err(StrategyError::Config(format!(
+            "SSU {ssu_id} ema_pullback_scalp {field} range must be between 0 and 1"
+        )))
+    }
+}
+
+fn count_range_from_filter_or_legacy(
+    range: Option<RawRange>,
+    field: &str,
+    legacy_min: Option<usize>,
+    legacy_max: Option<usize>,
+    ssu_id: i64,
+) -> Result<CountRange, StrategyError> {
+    if let Some(range) = range {
+        return CountRange::new(
+            require_count(range.min, &format!("{field}.min"), ssu_id)?,
+            require_count(range.max, &format!("{field}.max"), ssu_id)?,
+            field,
+            ssu_id,
+        );
+    }
+    CountRange::new(
+        require(legacy_min, &format!("{field}.min"), ssu_id)?,
+        require(legacy_max, &format!("{field}.max"), ssu_id)?,
+        field,
+        ssu_id,
+    )
+}
+
+fn require_count(value: Option<f64>, field: &str, ssu_id: i64) -> Result<usize, StrategyError> {
+    let value = require(value, field, ssu_id)?;
+    if value.is_finite() && value.fract() == 0.0 && value > 0.0 && value <= usize::MAX as f64 {
+        Ok(value as usize)
+    } else {
+        Err(StrategyError::Config(format!(
+            "SSU {ssu_id} ema_pullback_scalp {field} must be a positive integer"
+        )))
+    }
+}
+
 fn require_non_negative(
     value: Option<f64>,
     field: &str,
@@ -1850,17 +2271,6 @@ fn require_positive(value: Option<f64>, field: &str, ssu_id: i64) -> Result<f64,
     } else {
         Err(StrategyError::Config(format!(
             "SSU {ssu_id} ema_pullback_scalp {field} must be finite and positive"
-        )))
-    }
-}
-
-fn require_ratio(value: Option<f64>, field: &str, ssu_id: i64) -> Result<f64, StrategyError> {
-    let value = require_non_negative(value, field, ssu_id)?;
-    if value <= 1.0 {
-        Ok(value)
-    } else {
-        Err(StrategyError::Config(format!(
-            "SSU {ssu_id} ema_pullback_scalp {field} must be between 0 and 1"
         )))
     }
 }
@@ -1939,7 +2349,10 @@ fn parse_timeframe(value: &str) -> Result<Timeframe, StrategyError> {
         "3m" | "three_minute" | "threeminute" => Ok(Timeframe::ThreeMinute),
         "5m" | "five_minute" | "fiveminute" => Ok(Timeframe::FiveMinute),
         "15m" | "fifteen_minute" | "fifteenminute" => Ok(Timeframe::FifteenMinute),
+        "30m" | "thirty_minute" | "thirtyminute" => Ok(Timeframe::ThirtyMinute),
+        "75m" | "seventy_five_minute" | "seventyfiveminute" => Ok(Timeframe::SeventyFiveMinute),
         "1h" | "one_hour" | "onehour" => Ok(Timeframe::OneHour),
+        "4h" | "four_hour" | "fourhour" | "240m" => Ok(Timeframe::FourHour),
         "1d" | "one_day" | "oneday" => Ok(Timeframe::OneDay),
         other => Err(StrategyError::Parse(format!(
             "unsupported ema_pullback_scalp timeframe {other}"
@@ -1953,7 +2366,10 @@ fn timeframe_label(timeframe: Timeframe) -> &'static str {
         Timeframe::ThreeMinute => "3m",
         Timeframe::FiveMinute => "5m",
         Timeframe::FifteenMinute => "15m",
+        Timeframe::ThirtyMinute => "30m",
+        Timeframe::SeventyFiveMinute => "75m",
         Timeframe::OneHour => "1h",
+        Timeframe::FourHour => "4h",
         Timeframe::OneDay => "1d",
     }
 }
@@ -1988,6 +2404,7 @@ mod tests {
             high,
             low,
             close,
+            volume: 0.0,
             is_closed: true,
         }
     }
@@ -2028,7 +2445,6 @@ mod tests {
             "max_entry_extension_atr": 5.0,
             "stop_buffer_atr": 0.1,
             "target_enabled": false,
-            "time_stop_bars": 6,
             "exit_on_ema_fail_bars": 2,
             "pyramid_min_profit_r_before_add": 0.5,
             "pyramid_stop_adjustment": "better_of_breakeven_or_latest_entry_sl",
@@ -2104,7 +2520,7 @@ mod tests {
     #[test]
     fn broken_base_restarts_only_from_valid_anchor_candle() {
         let mut settings = complete_settings();
-        settings.base_window_bars = 2;
+        settings.base_candle_count.min = 2;
         let mut state = SetupState::new(&settings);
         let point = IndicatorPoint {
             ema_fast: 105.0,
@@ -2147,7 +2563,7 @@ mod tests {
     #[test]
     fn close_breakout_freezes_base_and_starts_setup_tracker() {
         let mut settings = complete_settings();
-        settings.base_window_bars = 2;
+        settings.base_candle_count.min = 2;
         let mut state = SetupState::new(&settings);
         let point = IndicatorPoint {
             ema_fast: 105.0,
@@ -2240,6 +2656,7 @@ mod tests {
                 high: close as f64,
                 low: close as f64,
                 close: close as f64,
+                volume: 0.0,
                 is_closed: true,
             })
             .collect::<Vec<_>>();

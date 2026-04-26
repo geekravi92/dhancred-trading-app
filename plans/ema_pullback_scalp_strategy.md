@@ -92,7 +92,6 @@ Example SSU:
     "stop_buffer_atr": 0.1,
     "target_enabled": false,
     "target_r_multiple": 1.5,
-    "time_stop_bars": 6,
     "exit_on_ema_fail_bars": 2,
 
     "pyramid_min_profit_r_before_add": 0.8,
@@ -157,7 +156,6 @@ Required validations:
 - `pullback_max_ratio > pullback_min_ratio`.
 - `target_enabled` must be explicitly present.
 - `target_r_multiple > 0` when `target_enabled = true`.
-- `time_stop_bars > 0`.
 - If `entry_policy = pyramid`, all pyramid parameters listed in the SSU contract must be present.
 - `pyramid_min_profit_r_before_add > 0` when `entry_policy = pyramid`.
 - `pyramid_stop_adjustment` must parse to the stop-adjustment enum when `entry_policy = pyramid`.
@@ -609,7 +607,6 @@ Long exit:
 ```text
 if closed_bar.low <= stop_price -> exit stop
 else if target_enabled and closed_bar.high >= target_price -> exit target
-else if bars_since_entry >= time_stop_bars -> exit time_stop
 else if close < ema_slow for exit_on_ema_fail_bars consecutive bars -> exit ema_fail
 ```
 
@@ -618,7 +615,6 @@ Short exit:
 ```text
 if closed_bar.high >= stop_price -> exit stop
 else if target_enabled and closed_bar.low <= target_price -> exit target
-else if bars_since_entry >= time_stop_bars -> exit time_stop
 else if close > ema_slow for exit_on_ema_fail_bars consecutive bars -> exit ema_fail
 ```
 
@@ -632,7 +628,6 @@ Reason examples:
 ```text
 ema_pullback_exit|reason=stop|tf=1m|closed_bar_end=...
 ema_pullback_exit|reason=target|tf=1m|r_multiple=1.5|closed_bar_end=...
-ema_pullback_exit|reason=time_stop|held_bars=6|closed_bar_end=...
 ema_pullback_exit|reason=ema_fail|fail_bars=2|closed_bar_end=...
 ```
 
@@ -808,8 +803,7 @@ Metadata example:
   "swing_extreme": 101.0,
   "breakout_level": 99.2,
   "last_breakout_level": 99.2,
-  "ema_fail_bars": 0,
-  "bars_since_entry": 0
+  "ema_fail_bars": 0
 }
 ```
 

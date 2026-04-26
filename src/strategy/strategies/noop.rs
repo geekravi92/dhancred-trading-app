@@ -1,5 +1,5 @@
 use crate::strategy::{
-    PriceUpdated, Strategy, StrategyContext, StrategyError, StrategySignal, SsuConfig,
+    PriceUpdated, SsuConfig, Strategy, StrategyContext, StrategyError, StrategySignal,
     TimeframeUpdate,
 };
 

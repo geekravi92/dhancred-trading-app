@@ -265,7 +265,10 @@ fn parse_timeframe(value: &str) -> Result<Timeframe, StrategyError> {
         "3m" | "three_minute" | "threeminute" => Ok(Timeframe::ThreeMinute),
         "5m" | "five_minute" | "fiveminute" => Ok(Timeframe::FiveMinute),
         "15m" | "fifteen_minute" | "fifteenminute" => Ok(Timeframe::FifteenMinute),
+        "30m" | "thirty_minute" | "thirtyminute" => Ok(Timeframe::ThirtyMinute),
+        "75m" | "seventy_five_minute" | "seventyfiveminute" => Ok(Timeframe::SeventyFiveMinute),
         "1h" | "one_hour" | "onehour" | "60m" => Ok(Timeframe::OneHour),
+        "4h" | "four_hour" | "fourhour" | "240m" => Ok(Timeframe::FourHour),
         "1d" | "one_day" | "oneday" => Ok(Timeframe::OneDay),
         other => Err(StrategyError::Parse(format!(
             "unsupported candle_cycle timeframe {other}"
@@ -279,7 +282,10 @@ fn timeframe_label(timeframe: Timeframe) -> &'static str {
         Timeframe::ThreeMinute => "3m",
         Timeframe::FiveMinute => "5m",
         Timeframe::FifteenMinute => "15m",
+        Timeframe::ThirtyMinute => "30m",
+        Timeframe::SeventyFiveMinute => "75m",
         Timeframe::OneHour => "1h",
+        Timeframe::FourHour => "4h",
         Timeframe::OneDay => "1d",
     }
 }
