@@ -382,7 +382,7 @@ Phase 1:
 
 Phase 2:
 
-- Migrate `candle_cycle` to emit new envelope signals with one instruction.
+- Migrate active strategies to emit new envelope signals with one instruction.
 - Update `StrategyPositionBook` or replace it with campaign/leg store APIs.
 - Update tests.
 
@@ -455,7 +455,7 @@ Required tests:
 - DB persists signal and instructions atomically.
 - DB loads signal with instructions in stable order.
 - Telegram sink summarizes new envelope correctly.
-- `candle_cycle` migration still emits entry and exit signals.
+- Active strategy migrations still emit entry and exit signals.
 - Existing runtime dispatch still sends all strategy signals to sinks.
 
 ## 15. Acceptance Criteria

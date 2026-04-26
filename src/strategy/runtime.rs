@@ -1404,8 +1404,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use chrono::DateTime;
-
     use super::*;
     use crate::strategy::Bar;
 
@@ -1486,19 +1484,6 @@ mod tests {
                     is_closed: true,
                 })
                 .collect())
-        }
-    }
-
-    struct EmptyHistorical;
-
-    impl HistoricalReplayStore for EmptyHistorical {
-        fn load_bars(
-            &self,
-            _instrument: &str,
-            _timeframe: Timeframe,
-            _limit: usize,
-        ) -> Result<Vec<Bar>, StrategyError> {
-            Ok(Vec::new())
         }
     }
 
@@ -1603,114 +1588,4 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
-    #[test]
-    fn candle_cycle_strategy_enters_exits_and_reenters_after_cooldown() {
-        let sqlite_path = temp_sqlite("strategy-candle-cycle");
-        let signal_sink = Arc::new(InMemorySignalSink::new());
-        let positions =
-            Arc::new(SqliteStrategyPositionBook::new(sqlite_path.clone()).expect("positions"));
-        let trade_contexts =
-            Arc::new(SqliteStrategyTradeContextStore::new(sqlite_path.clone()).expect("contexts"));
-        let runtime = StrategyRuntime::new(
-            Arc::new(FakeRepository {
-                ssus: vec![SsuConfig {
-                    ssu_id: 7,
-                    strategy_key: "candle_cycle".to_string(),
-                    enabled: true,
-                    trade_gap_secs: 0,
-                    max_overlap: 1,
-                    max_positions_per_day: 0,
-                    required_timeframes: vec![Timeframe::OneMinute],
-                    indicator_specs: Vec::new(),
-                    params_json: r#"{"timeframe":"1m","hold_candles":3,"cooldown_candles":2}"#
-                        .to_string(),
-                }],
-            }),
-            Arc::new(BuiltinStrategyFactory),
-            Arc::new(EmptyHistorical),
-            Arc::clone(&positions) as Arc<dyn StrategyPositionBook>,
-            trade_contexts,
-            SignalRouter::new(vec![signal_sink.clone()]),
-            vec!["NIFTY".to_string()],
-            0,
-            32,
-            CandleAlignmentMap::new(),
-        );
-
-        runtime.reload_ssus().expect("reload");
-        for (index, price) in [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0]
-            .into_iter()
-            .enumerate()
-        {
-            let tick_at = ts_millis(&format!("2026-04-16T03:{:02}:00Z", 45 + index));
-            runtime
-                .on_tick("NIFTY", price, tick_at, true)
-                .expect("tick");
-        }
-
-        let open_positions = positions.list_open_by_ssu(7).expect("open positions");
-        assert_eq!(open_positions.len(), 1);
-        assert_eq!(
-            open_positions[0].position_id,
-            format!("CMP-7-NIFTY-{}-L1", ts_millis("2026-04-16T03:51:00Z"))
-        );
-        assert_eq!(
-            open_positions[0].entry_at,
-            ts_millis("2026-04-16T03:51:00Z")
-        );
-
-        let connection = rusqlite::Connection::open(sqlite_path).expect("sqlite");
-        let mut statement = connection
-            .prepare(
-                "\
-                SELECT position_id, status, exit_reason
-                FROM virtual_position
-                ORDER BY entry_at, position_id
-                ",
-            )
-            .expect("statement");
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })
-            .expect("rows")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect");
-        assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows[0].0,
-            format!("CMP-7-NIFTY-{}-L1", ts_millis("2026-04-16T03:46:00Z"))
-        );
-        assert_eq!(rows[0].1, "CLOSED");
-        assert!(
-            rows[0]
-                .2
-                .as_deref()
-                .is_some_and(|reason| reason.contains("candle_cycle_exit"))
-        );
-        assert_eq!(
-            rows[1].0,
-            format!("CMP-7-NIFTY-{}-L1", ts_millis("2026-04-16T03:51:00Z"))
-        );
-        assert_eq!(rows[1].1, "OPEN");
-
-        assert_eq!(
-            signal_sink.messages(),
-            vec![
-                "ENTRY_LONG".to_string(),
-                "EXIT_LONG".to_string(),
-                "ENTRY_LONG".to_string(),
-            ]
-        );
-    }
-
-    fn ts_millis(value: &str) -> u64 {
-        DateTime::parse_from_rfc3339(value)
-            .expect("timestamp")
-            .timestamp_millis() as u64
-    }
 }

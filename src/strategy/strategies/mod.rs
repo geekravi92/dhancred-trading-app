@@ -1,5 +1,4 @@
 mod adaptive_supertrend;
-mod candle_cycle;
 mod dhanrekha;
 mod ema_pullback_scalp;
 mod exponential_edge;
@@ -14,7 +13,6 @@ pub(crate) fn strategy_by_key(strategy_key: &str) -> Result<Arc<dyn Strategy>, S
         "adaptive_supertrend" => Ok(Arc::new(
             adaptive_supertrend::AdaptiveSupertrendStrategy::default(),
         )),
-        "candle_cycle" => Ok(Arc::new(candle_cycle::CandleCycleStrategy::default())),
         "dhanrekha" => Ok(Arc::new(dhanrekha::DhanrekhaStrategy::default())),
         "ema_pullback_scalp" => Ok(Arc::new(
             ema_pullback_scalp::EmaPullbackScalpStrategy::default(),
@@ -24,7 +22,7 @@ pub(crate) fn strategy_by_key(strategy_key: &str) -> Result<Arc<dyn Strategy>, S
         )),
         "noop" => Ok(Arc::new(noop::NoopStrategy)),
         value => Err(StrategyError::Unsupported(format!(
-            "unsupported strategy_key {value}; available builtins: adaptive_supertrend, candle_cycle, dhanrekha, ema_pullback_scalp, exponential_edge, noop"
+            "unsupported strategy_key {value}; available builtins: adaptive_supertrend, dhanrekha, ema_pullback_scalp, exponential_edge, noop"
         ))),
     }
 }
