@@ -14,6 +14,8 @@ pub enum StrategySignalType {
     EntryShort,
     ExitLong,
     ExitShort,
+    ExitLongPartial,
+    ExitShortPartial,
     Shift,
     Rollover,
 }
@@ -21,8 +23,10 @@ pub enum StrategySignalType {
 impl StrategySignalType {
     pub fn side(self) -> Option<SignalSide> {
         match self {
-            Self::EntryLong | Self::ExitLong => Some(SignalSide::Long),
-            Self::EntryShort | Self::ExitShort => Some(SignalSide::Short),
+            Self::EntryLong | Self::ExitLong | Self::ExitLongPartial => Some(SignalSide::Long),
+            Self::EntryShort | Self::ExitShort | Self::ExitShortPartial => {
+                Some(SignalSide::Short)
+            }
             Self::Shift | Self::Rollover => None,
         }
     }
@@ -32,7 +36,15 @@ impl StrategySignalType {
     }
 
     pub fn is_exit(self) -> bool {
+        self.is_full_exit() || self.is_partial_exit()
+    }
+
+    pub fn is_full_exit(self) -> bool {
         matches!(self, Self::ExitLong | Self::ExitShort)
+    }
+
+    pub fn is_partial_exit(self) -> bool {
+        matches!(self, Self::ExitLongPartial | Self::ExitShortPartial)
     }
 }
 
@@ -167,6 +179,38 @@ impl StrategySignal {
         )
     }
 
+    pub fn single_leg_partial_exit(
+        ssu_id: i64,
+        strategy_key: &str,
+        trigger_instrument: &str,
+        side: SignalSide,
+        price: f64,
+        quantity_ratio: f64,
+        reason: String,
+        generated_at: u64,
+    ) -> Self {
+        let signal_type = match side {
+            SignalSide::Long => StrategySignalType::ExitLongPartial,
+            SignalSide::Short => StrategySignalType::ExitShortPartial,
+        };
+        let action = match side {
+            SignalSide::Long => TradeAction::Sell,
+            SignalSide::Short => TradeAction::Buy,
+        };
+        let mut signal = single_leg_signal(
+            ssu_id,
+            strategy_key,
+            trigger_instrument,
+            signal_type,
+            action,
+            price,
+            reason,
+            generated_at,
+        );
+        signal.instructions[0].quantity_ratio = quantity_ratio;
+        signal
+    }
+
     pub fn side(&self) -> Option<SignalSide> {
         self.signal_type.side()
     }
@@ -221,6 +265,8 @@ pub fn signal_type_label(value: StrategySignalType) -> &'static str {
         StrategySignalType::EntryShort => "ENTRY_SHORT",
         StrategySignalType::ExitLong => "EXIT_LONG",
         StrategySignalType::ExitShort => "EXIT_SHORT",
+        StrategySignalType::ExitLongPartial => "EXIT_LONG_PARTIAL",
+        StrategySignalType::ExitShortPartial => "EXIT_SHORT_PARTIAL",
         StrategySignalType::Shift => "SHIFT",
         StrategySignalType::Rollover => "ROLLOVER",
     }
@@ -232,6 +278,8 @@ pub fn parse_signal_type(value: &str) -> Option<StrategySignalType> {
         "ENTRY_SHORT" => Some(StrategySignalType::EntryShort),
         "EXIT_LONG" => Some(StrategySignalType::ExitLong),
         "EXIT_SHORT" => Some(StrategySignalType::ExitShort),
+        "EXIT_LONG_PARTIAL" => Some(StrategySignalType::ExitLongPartial),
+        "EXIT_SHORT_PARTIAL" => Some(StrategySignalType::ExitShortPartial),
         "SHIFT" => Some(StrategySignalType::Shift),
         "ROLLOVER" => Some(StrategySignalType::Rollover),
         _ => None,
@@ -353,6 +401,27 @@ mod tests {
     }
 
     #[test]
+    fn single_leg_partial_exit_marks_partial_type_and_quantity() {
+        let long_partial = StrategySignal::single_leg_partial_exit(
+            7,
+            "adaptive_supertrend",
+            "BTCUSD",
+            SignalSide::Long,
+            101.0,
+            1.0 / 3.0,
+            "tp1 partial".to_string(),
+            1_777_100_001_000,
+        );
+
+        assert_eq!(long_partial.signal_type, StrategySignalType::ExitLongPartial);
+        assert_eq!(long_partial.instructions[0].action, TradeAction::Sell);
+        assert!((long_partial.instructions[0].quantity_ratio - 1.0 / 3.0).abs() < 0.000001);
+        assert!(long_partial.signal_type.is_exit());
+        assert!(long_partial.signal_type.is_partial_exit());
+        assert!(!long_partial.signal_type.is_full_exit());
+    }
+
+    #[test]
     fn signal_envelope_serializes_multiple_trade_instructions() {
         let signal = StrategySignal {
             signal_id: "SIG-IRON-CONDOR".to_string(),
@@ -414,6 +483,10 @@ mod tests {
         assert_eq!(
             parse_signal_type("ENTRY_LONG"),
             Some(StrategySignalType::EntryLong)
+        );
+        assert_eq!(
+            parse_signal_type("exit-long-partial"),
+            Some(StrategySignalType::ExitLongPartial)
         );
         assert_eq!(parse_trade_action("sell"), Some(TradeAction::Sell));
         assert_eq!(parse_instrument_kind("fut"), Some(InstrumentKind::Fut));

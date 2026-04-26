@@ -116,7 +116,10 @@ fn timeframe_label(timeframe: Timeframe) -> &'static str {
         Timeframe::ThreeMinute => "3m",
         Timeframe::FiveMinute => "5m",
         Timeframe::FifteenMinute => "15m",
+        Timeframe::ThirtyMinute => "30m",
+        Timeframe::SeventyFiveMinute => "75m",
         Timeframe::OneHour => "1h",
+        Timeframe::FourHour => "4h",
     }
 }
 

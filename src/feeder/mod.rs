@@ -1,9 +1,13 @@
+pub mod candle_alignment;
 pub mod catalog;
 pub mod error;
 pub mod event;
 pub mod historical_candles;
 pub mod universe;
 
+pub use candle_alignment::{
+    CandleAlignment, CandleAlignmentMap, candle_alignments_from_catalog, merge_candle_alignments,
+};
 pub use catalog::{
     InstrumentCatalog, InstrumentDefinition, InstrumentName, InstrumentType, InstrumentUniverse,
     UNIVERSAL_INSTRUMENT_CSV_HEADER, UniverseFilter, parse_instrument_type,

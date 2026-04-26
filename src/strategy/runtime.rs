@@ -5,11 +5,14 @@ use chrono::{Datelike, FixedOffset};
 use rusqlite::params;
 
 use crate::config::AppConfig;
-use crate::feeder::{InstrumentCatalog, InstrumentType, Timeframe};
+use crate::feeder::{
+    CandleAlignmentMap, InstrumentCatalog, InstrumentType, Timeframe,
+    candle_alignments_from_catalog, merge_candle_alignments,
+};
 use crate::notification::notify_message;
 use crate::storage::strategy::StrategySqlite;
 use crate::strategy::{
-    HistoricalReplayStore, InMemoryPriceStore, IndicatorSpec, PriceStore, PriceUpdated,
+    Bar, HistoricalReplayStore, InMemoryPriceStore, IndicatorSpec, PriceStore, PriceUpdated,
     SharedTimeframeEngine, SignalSide, SsuConfig, StrategyContext, StrategyError, StrategySignal,
     TimeframeEngine, TimeframeUpdate, instrument_kind_label, signal_type_label, trade_action_label,
 };
@@ -39,6 +42,16 @@ pub struct StrategyPosition {
 
 pub trait Strategy: Send + Sync {
     fn strategy_key(&self) -> &'static str;
+    fn on_tick_updated(
+        &self,
+        _ctx: &StrategyContext,
+        _ssu: &SsuConfig,
+        _event: &PriceUpdated,
+        _tf_update: &TimeframeUpdate,
+    ) -> Result<Vec<StrategySignal>, StrategyError> {
+        Ok(Vec::new())
+    }
+
     fn on_price_updated(
         &self,
         ctx: &StrategyContext,
@@ -64,6 +77,10 @@ pub trait StrategyPositionBook: Send + Sync {
         &self,
         signal: &StrategySignal,
         ssu: &SsuConfig,
+    ) -> Result<StrategyPosition, StrategyError>;
+    fn partial_close_position(
+        &self,
+        signal: &StrategySignal,
     ) -> Result<StrategyPosition, StrategyError>;
     fn close_position(&self, signal: &StrategySignal) -> Result<StrategyPosition, StrategyError>;
 }
@@ -165,12 +182,14 @@ impl SqliteSsuRepository {
             sqlite: StrategySqlite::new(path.into())?,
         })
     }
-}
 
-impl SsuRepository for SqliteSsuRepository {
-    fn load_active_ssus(&self) -> Result<Vec<SsuConfig>, StrategyError> {
+    pub fn load_all_ssus(&self) -> Result<Vec<SsuConfig>, StrategyError> {
+        self.load_ssus(false)
+    }
+
+    fn load_ssus(&self, only_enabled: bool) -> Result<Vec<SsuConfig>, StrategyError> {
         let connection = self.sqlite.open_connection()?;
-        let mut statement = connection.prepare(
+        let query = if only_enabled {
             "\
             SELECT
                 ssu_id,
@@ -185,8 +204,24 @@ impl SsuRepository for SqliteSsuRepository {
             FROM strategy_ssu
             WHERE enabled = 1
             ORDER BY ssu_id
-            ",
-        )?;
+            "
+        } else {
+            "\
+            SELECT
+                ssu_id,
+                strategy_key,
+                enabled,
+                trade_gap_secs,
+                max_overlap,
+                max_positions_per_day,
+                required_timeframes_json,
+                indicator_specs_json,
+                params_json
+            FROM strategy_ssu
+            ORDER BY ssu_id
+            "
+        };
+        let mut statement = connection.prepare(query)?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -228,6 +263,12 @@ impl SsuRepository for SqliteSsuRepository {
         }
 
         Ok(configs)
+    }
+}
+
+impl SsuRepository for SqliteSsuRepository {
+    fn load_active_ssus(&self) -> Result<Vec<SsuConfig>, StrategyError> {
+        self.load_ssus(true)
     }
 }
 
@@ -437,10 +478,83 @@ impl StrategyPositionBook for SqliteStrategyPositionBook {
         Ok(position)
     }
 
-    fn close_position(&self, signal: &StrategySignal) -> Result<StrategyPosition, StrategyError> {
-        if !signal.signal_type.is_exit() {
+    fn partial_close_position(
+        &self,
+        signal: &StrategySignal,
+    ) -> Result<StrategyPosition, StrategyError> {
+        if !signal.signal_type.is_partial_exit() {
             return Err(StrategyError::Rule(format!(
-                "signal {} is not an exit signal",
+                "signal {} is not a partial exit signal",
+                signal.signal_id
+            )));
+        }
+        let side = signal.signal_type.side().ok_or_else(|| {
+            StrategyError::Rule(format!(
+                "signal {} has no directional side",
+                signal.signal_id
+            ))
+        })?;
+        let instruction = signal.primary_instruction().ok_or_else(|| {
+            StrategyError::Rule(format!(
+                "signal {} has no trade instructions",
+                signal.signal_id
+            ))
+        })?;
+        if !instruction.quantity_ratio.is_finite()
+            || instruction.quantity_ratio <= 0.0
+            || instruction.quantity_ratio >= 1.0
+        {
+            return Err(StrategyError::Rule(format!(
+                "signal {} partial exit quantity_ratio must be between 0 and 1",
+                signal.signal_id
+            )));
+        }
+
+        let state = self.state.lock().expect("position store lock poisoned");
+        let position_id = state
+            .positions
+            .get(&instruction.leg_id)
+            .filter(|position| {
+                position.ssu_id == signal.ssu_id
+                    && position.trade_instrument == instruction.instrument_name
+                    && position.side == side
+                    && position.status == PositionStatus::Open
+            })
+            .map(|position| position.position_id.clone())
+            .or_else(|| {
+                state
+                    .positions
+                    .values()
+                    .filter(|position| {
+                        position.ssu_id == signal.ssu_id
+                            && position.trade_instrument == instruction.instrument_name
+                            && position.side == side
+                            && position.status == PositionStatus::Open
+                    })
+                    .max_by_key(|position| position.entry_at)
+                    .map(|position| position.position_id.clone())
+            });
+        let Some(position_id) = position_id else {
+            return Err(StrategyError::Rule(format!(
+                "no open virtual position found for SSU {} instrument {}",
+                signal.ssu_id, instruction.instrument_name
+            )));
+        };
+        let position = state
+            .positions
+            .get(&position_id)
+            .expect("position must exist")
+            .clone();
+        drop(state);
+
+        persist_signal(&self.sqlite, signal)?;
+        Ok(position)
+    }
+
+    fn close_position(&self, signal: &StrategySignal) -> Result<StrategyPosition, StrategyError> {
+        if !signal.signal_type.is_full_exit() {
+            return Err(StrategyError::Rule(format!(
+                "signal {} is not a full exit signal",
                 signal.signal_id
             )));
         }
@@ -692,10 +806,14 @@ impl StrategyRuntime {
         warmup_spot_instruments: Vec<String>,
         warmup_bars: usize,
         recent_bars: usize,
+        candle_alignments: CandleAlignmentMap,
     ) -> Self {
         Self {
             prices: Arc::new(InMemoryPriceStore::new()),
-            timeframes: Arc::new(SharedTimeframeEngine::new(recent_bars)),
+            timeframes: Arc::new(SharedTimeframeEngine::with_alignments(
+                recent_bars,
+                candle_alignments,
+            )),
             strategy_positions,
             trade_contexts,
             repository,
@@ -799,6 +917,90 @@ impl StrategyRuntime {
             .expect("active SSU lock poisoned")
             .clone();
         for loaded in ssus {
+            let tick_signals =
+                loaded
+                    .strategy
+                    .on_tick_updated(&ctx, &loaded.config, &event, &tf_update)?;
+            for signal in tick_signals {
+                self.signal_router.route(&signal)?;
+            }
+
+            let signals =
+                loaded
+                    .strategy
+                    .on_price_updated(&ctx, &loaded.config, &event, &tf_update)?;
+            for signal in signals {
+                self.signal_router.route(&signal)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn warmup_closed_bars(&self, bars: &[Bar]) -> Result<(), StrategyError> {
+        let _gate = self
+            .lifecycle_gate
+            .read()
+            .expect("strategy lifecycle gate poisoned");
+        let ssus = self
+            .active_ssus
+            .read()
+            .expect("active SSU lock poisoned")
+            .clone();
+
+        for bar in bars {
+            for loaded in &ssus {
+                let required_by_ssu = loaded.config.required_timeframes.contains(&bar.timeframe)
+                    || loaded
+                        .config
+                        .indicator_specs
+                        .iter()
+                        .any(|spec| spec.timeframe == bar.timeframe);
+                if required_by_ssu {
+                    self.timeframes.warmup(
+                        &bar.instrument,
+                        bar.timeframe,
+                        std::slice::from_ref(bar),
+                        loaded.config.ssu_id,
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn on_closed_bar(&self, bar: Bar, trigger_for_strategy: bool) -> Result<(), StrategyError> {
+        let instrument_lock = self.instrument_lock(&bar.instrument);
+        let _instrument_guard = instrument_lock.lock().expect("instrument lock poisoned");
+        let _gate = self
+            .lifecycle_gate
+            .read()
+            .expect("strategy lifecycle gate poisoned");
+
+        self.prices
+            .put_price(&bar.instrument, bar.close, bar.end_at);
+        let tf_update = self.timeframes.on_closed_bar(&bar)?;
+        if !trigger_for_strategy || tf_update.closed_timeframes.is_empty() {
+            return Ok(());
+        }
+
+        let event = PriceUpdated {
+            trigger_instrument: bar.instrument.clone(),
+            at: bar.end_at,
+        };
+        let ctx = StrategyContext {
+            prices: Arc::clone(&self.prices),
+            timeframes: Arc::clone(&self.timeframes) as Arc<dyn TimeframeEngine>,
+            strategy_positions: Arc::clone(&self.strategy_positions),
+            trade_contexts: Arc::clone(&self.trade_contexts),
+        };
+        let ssus = self
+            .active_ssus
+            .read()
+            .expect("active SSU lock poisoned")
+            .clone();
+        for loaded in ssus {
             let signals =
                 loaded
                     .strategy
@@ -846,6 +1048,7 @@ pub fn start_strategy_runtime(
             )
         })?;
     let warmup_spot_instruments = load_spot_instruments(config)?;
+    let candle_alignments = load_candle_alignments(config)?;
     let repository = Arc::new(SqliteSsuRepository::new(
         strategy_config.sqlite_path.clone(),
     )?);
@@ -855,9 +1058,12 @@ pub fn start_strategy_runtime(
     let trade_contexts = Arc::new(SqliteStrategyTradeContextStore::new(
         strategy_config.sqlite_path.clone(),
     )?);
-    let historical = Arc::new(crate::strategy::SqliteHistoricalReplayStore::new(
-        historical_config.sqlite_path.clone(),
-    ));
+    let historical = Arc::new(
+        crate::strategy::SqliteHistoricalReplayStore::with_alignments(
+            historical_config.sqlite_path.clone(),
+            candle_alignments.clone(),
+        ),
+    );
     let runtime = Arc::new(StrategyRuntime::new(
         repository,
         Arc::new(BuiltinStrategyFactory),
@@ -868,6 +1074,7 @@ pub fn start_strategy_runtime(
         warmup_spot_instruments,
         strategy_config.warmup_bars,
         strategy_config.recent_bars,
+        candle_alignments,
     ));
     let _ = runtime.reload_ssus()?;
     Ok(Some(runtime))
@@ -889,6 +1096,24 @@ fn load_spot_instruments(config: &AppConfig) -> Result<Vec<String>, StrategyErro
     }
 
     Ok(instruments.into_iter().collect())
+}
+
+fn load_candle_alignments(config: &AppConfig) -> Result<CandleAlignmentMap, StrategyError> {
+    let mut alignments = CandleAlignmentMap::new();
+
+    if let Some(delta) = config.brokers.delta.as_ref().filter(|delta| delta.enabled) {
+        let catalog = InstrumentCatalog::load_csv(&delta.base_instruments_csv)
+            .map_err(|error| StrategyError::Config(error.to_string()))?;
+        merge_candle_alignments(&mut alignments, candle_alignments_from_catalog(&catalog));
+    }
+
+    if let Some(fyers) = config.brokers.fyers.as_ref().filter(|fyers| fyers.enabled) {
+        let catalog = InstrumentCatalog::load_csv(&fyers.base_instruments_csv)
+            .map_err(|error| StrategyError::Config(error.to_string()))?;
+        merge_candle_alignments(&mut alignments, candle_alignments_from_catalog(&catalog));
+    }
+
+    Ok(alignments)
 }
 
 fn collect_spot_instruments(catalog: &InstrumentCatalog, instruments: &mut BTreeSet<String>) {
@@ -949,7 +1174,10 @@ fn parse_timeframe(value: &str) -> Result<Timeframe, StrategyError> {
         "3m" | "three_minute" => Ok(Timeframe::ThreeMinute),
         "5m" | "five_minute" => Ok(Timeframe::FiveMinute),
         "15m" | "fifteen_minute" => Ok(Timeframe::FifteenMinute),
+        "30m" | "thirty_minute" => Ok(Timeframe::ThirtyMinute),
+        "75m" | "seventy_five_minute" => Ok(Timeframe::SeventyFiveMinute),
         "1h" | "one_hour" => Ok(Timeframe::OneHour),
+        "4h" | "four_hour" => Ok(Timeframe::FourHour),
         "1d" | "one_day" => Ok(Timeframe::OneDay),
         value => Err(StrategyError::Parse(format!(
             "unsupported timeframe value {value}"
@@ -1254,6 +1482,7 @@ mod tests {
                     high: 101.0 + index as f64,
                     low: 99.0 + index as f64,
                     close: 100.5 + index as f64,
+                    volume: 0.0,
                     is_closed: true,
                 })
                 .collect())
@@ -1363,6 +1592,7 @@ mod tests {
             vec!["NIFTY".to_string()],
             32,
             32,
+            CandleAlignmentMap::new(),
         );
 
         runtime.reload_ssus().expect("reload");
@@ -1404,6 +1634,7 @@ mod tests {
             vec!["NIFTY".to_string()],
             0,
             32,
+            CandleAlignmentMap::new(),
         );
 
         runtime.reload_ssus().expect("reload");

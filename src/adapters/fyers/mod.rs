@@ -17,5 +17,10 @@ pub fn run_live(
     strategy_runtime: Option<Arc<StrategyRuntimeHandle>>,
     max_events: usize,
 ) -> Result<(), FeedError> {
-    runtime::run_live(config, historical_candles_config, strategy_runtime, max_events)
+    runtime::run_live(
+        config,
+        historical_candles_config,
+        strategy_runtime,
+        max_events,
+    )
 }

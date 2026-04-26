@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
-use chrono::{Datelike, Duration as ChronoDuration, FixedOffset, TimeZone, Timelike};
+use chrono::{Datelike, Duration as ChronoDuration, TimeZone, Timelike, Utc};
 
 use crate::config::HistoricalCandlesSection;
 use crate::feeder::{
@@ -13,7 +13,6 @@ use crate::feeder::{
 };
 use crate::storage::historical_candles::HistoricalCandleStore;
 
-const IST_OFFSET_SECONDS: i32 = 5 * 60 * 60 + 30 * 60;
 const FLUSH_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
 
 pub struct HistoricalCandleService {
@@ -117,7 +116,7 @@ impl CandleState {
         instrument_name: InstrumentName,
         tick: &PriceTick,
     ) -> Result<Option<Candle>, FeedError> {
-        let (bucket_start, bucket_end) = one_minute_bucket_bounds_ist(tick.time.as_u64())?;
+        let (bucket_start, bucket_end) = one_minute_bucket_bounds_utc(tick.time.as_u64())?;
         let already_closed_until = self
             .last_closed_end
             .get(&instrument_name)
@@ -296,23 +295,20 @@ impl Drop for HistoricalCandleFlusher {
     }
 }
 
-fn one_minute_bucket_bounds_ist(unix_millis: u64) -> Result<(u64, u64), FeedError> {
-    let ist = FixedOffset::east_opt(IST_OFFSET_SECONDS)
-        .ok_or_else(|| FeedError::Config("failed to create IST fixed offset".to_string()))?;
+fn one_minute_bucket_bounds_utc(unix_millis: u64) -> Result<(u64, u64), FeedError> {
     let utc = chrono::DateTime::from_timestamp_millis(unix_millis as i64)
         .ok_or_else(|| FeedError::Parse(format!("invalid unix millis {unix_millis}")))?;
-    let ist_dt = utc.with_timezone(&ist);
-    let bucket_start = ist
+    let bucket_start = Utc
         .with_ymd_and_hms(
-            ist_dt.year(),
-            ist_dt.month(),
-            ist_dt.day(),
-            ist_dt.hour(),
-            ist_dt.minute(),
+            utc.year(),
+            utc.month(),
+            utc.day(),
+            utc.hour(),
+            utc.minute(),
             0,
         )
         .single()
-        .ok_or_else(|| FeedError::Parse("failed to compute IST minute bucket".to_string()))?;
+        .ok_or_else(|| FeedError::Parse("failed to compute UTC minute bucket".to_string()))?;
     let bucket_end = bucket_start + ChronoDuration::minutes(1);
 
     Ok((

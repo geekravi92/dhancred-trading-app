@@ -23,6 +23,7 @@ pub use signal::{
     parse_price_policy, parse_price_policy_type, parse_signal_type, parse_trade_action,
     price_policy_type_label, serialize_price_policy, signal_type_label, trade_action_label,
 };
+pub(crate) use timeframes::bucket_bounds;
 pub use timeframes::{SharedTimeframeEngine, TimeframeEngine};
 
 pub use crate::feeder::Timeframe;
@@ -50,6 +51,7 @@ pub struct Bar {
     pub high: f64,
     pub low: f64,
     pub close: f64,
+    pub volume: f64,
     pub is_closed: bool,
 }
 

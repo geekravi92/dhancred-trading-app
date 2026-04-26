@@ -6,8 +6,8 @@ use crate::adapters::fyers::historical::FyersHistoricalClient;
 use crate::adapters::fyers::latest_price_file::FyersLatestPriceFile;
 use crate::adapters::fyers::live::FyersLiveFeeder;
 use crate::adapters::fyers::master::{
-    FyersUniverseSummary, build_fyers_universe_summary_from_master_csvs,
-    refresh_all, selected_trading_symbols, write_fyers_derivatives_csv,
+    FyersUniverseSummary, build_fyers_universe_summary_from_master_csvs, refresh_all,
+    selected_trading_symbols, write_fyers_derivatives_csv,
 };
 use crate::adapters::fyers::session;
 use crate::adapters::historical::{recover_spot_history, start_spot_history_maintenance};

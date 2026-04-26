@@ -372,7 +372,10 @@ fn timeframe_label(timeframe: Timeframe) -> &'static str {
         Timeframe::ThreeMinute => "3m",
         Timeframe::FiveMinute => "5m",
         Timeframe::FifteenMinute => "15m",
+        Timeframe::ThirtyMinute => "30m",
+        Timeframe::SeventyFiveMinute => "75m",
         Timeframe::OneHour => "1h",
+        Timeframe::FourHour => "4h",
         Timeframe::OneDay => "1d",
     }
 }
@@ -387,7 +390,10 @@ fn timeframe_millis(timeframe: Timeframe) -> Result<u64, FeedError> {
         Timeframe::ThreeMinute => Ok(180_000),
         Timeframe::FiveMinute => Ok(300_000),
         Timeframe::FifteenMinute => Ok(900_000),
+        Timeframe::ThirtyMinute => Ok(1_800_000),
+        Timeframe::SeventyFiveMinute => Ok(4_500_000),
         Timeframe::OneHour => Ok(3_600_000),
+        Timeframe::FourHour => Ok(14_400_000),
         Timeframe::OneDay => Ok(86_400_000),
     }
 }

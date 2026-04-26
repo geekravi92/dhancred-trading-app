@@ -152,7 +152,10 @@ fn timeframe_label(timeframe: Timeframe) -> &'static str {
         Timeframe::ThreeMinute => "3m",
         Timeframe::FiveMinute => "5m",
         Timeframe::FifteenMinute => "15m",
+        Timeframe::ThirtyMinute => "30m",
+        Timeframe::SeventyFiveMinute => "75m",
         Timeframe::OneHour => "1h",
+        Timeframe::FourHour => "4h",
     }
 }
 
@@ -303,8 +306,7 @@ impl HistoricalRateLimiter {
                     .find(|instant| now.duration_since(**instant) < Duration::from_secs(1))
             {
                 wait_for = wait_for.max(
-                    Duration::from_secs(1)
-                        .saturating_sub(now.duration_since(*oldest_in_second))
+                    Duration::from_secs(1).saturating_sub(now.duration_since(*oldest_in_second))
                         + Duration::from_millis(5),
                 );
             }
@@ -312,8 +314,7 @@ impl HistoricalRateLimiter {
                 && let Some(oldest_in_minute) = req_times.front()
             {
                 wait_for = wait_for.max(
-                    Duration::from_secs(60)
-                        .saturating_sub(now.duration_since(*oldest_in_minute))
+                    Duration::from_secs(60).saturating_sub(now.duration_since(*oldest_in_minute))
                         + Duration::from_millis(5),
                 );
             }

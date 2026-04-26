@@ -31,7 +31,10 @@ pub enum Timeframe {
     ThreeMinute,
     FiveMinute,
     FifteenMinute,
+    ThirtyMinute,
+    SeventyFiveMinute,
     OneHour,
+    FourHour,
     OneDay,
 }
 

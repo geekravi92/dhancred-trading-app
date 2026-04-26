@@ -1,7 +1,6 @@
-use crate::feeder::{Candle, InstrumentName, Timeframe};
+use crate::feeder::{Candle, CandleAlignment, CandleAlignmentMap, InstrumentName, Timeframe};
 use crate::storage::historical_candles::HistoricalCandleStore;
-use crate::strategy::timeframes::bucket_bounds_ist;
-use crate::strategy::{Bar, StrategyError};
+use crate::strategy::{Bar, StrategyError, bucket_bounds};
 
 pub trait HistoricalReplayStore: Send + Sync {
     fn load_bars(
@@ -15,13 +14,26 @@ pub trait HistoricalReplayStore: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct SqliteHistoricalReplayStore {
     sqlite_path: String,
+    alignments: CandleAlignmentMap,
 }
 
 impl SqliteHistoricalReplayStore {
     pub fn new(sqlite_path: impl Into<String>) -> Self {
+        Self::with_alignments(sqlite_path, CandleAlignmentMap::new())
+    }
+
+    pub fn with_alignments(sqlite_path: impl Into<String>, alignments: CandleAlignmentMap) -> Self {
         Self {
             sqlite_path: sqlite_path.into(),
+            alignments,
         }
+    }
+
+    fn alignment_for(&self, instrument: &str) -> CandleAlignment {
+        self.alignments
+            .get(instrument)
+            .copied()
+            .unwrap_or(CandleAlignment::UTC)
     }
 }
 
@@ -37,22 +49,40 @@ impl HistoricalReplayStore for SqliteHistoricalReplayStore {
         let instrument_name = InstrumentName::new(instrument);
 
         match timeframe {
-            Timeframe::OneMinute | Timeframe::OneDay => store
+            Timeframe::OneMinute => store
                 .load_recent_candles(&instrument_name, timeframe, limit)
                 .map_err(|error| StrategyError::Io(error.to_string()))
                 .map(|candles| candles.into_iter().map(bar_from_candle).collect()),
             Timeframe::ThreeMinute
             | Timeframe::FiveMinute
             | Timeframe::FifteenMinute
-            | Timeframe::OneHour => {
+            | Timeframe::ThirtyMinute
+            | Timeframe::SeventyFiveMinute
+            | Timeframe::OneHour
+            | Timeframe::FourHour
+            | Timeframe::OneDay => {
+                let direct = store
+                    .load_recent_candles(&instrument_name, timeframe, limit)
+                    .map_err(|error| StrategyError::Io(error.to_string()))?;
+                if !direct.is_empty() {
+                    return Ok(direct.into_iter().map(bar_from_candle).collect());
+                }
                 let source = store
                     .load_recent_candles(
                         &instrument_name,
                         Timeframe::OneMinute,
-                        limit.saturating_mul(timeframe_factor(timeframe)).saturating_add(8),
+                        limit
+                            .saturating_mul(timeframe_factor(timeframe))
+                            .saturating_add(8),
                     )
                     .map_err(|error| StrategyError::Io(error.to_string()))?;
-                Ok(aggregate_bars(instrument, timeframe, &source, limit))
+                Ok(aggregate_bars(
+                    instrument,
+                    timeframe,
+                    &source,
+                    limit,
+                    self.alignment_for(instrument),
+                ))
             }
         }
     }
@@ -68,6 +98,7 @@ fn bar_from_candle(candle: Candle) -> Bar {
         high: candle.high.as_f64(),
         low: candle.low.as_f64(),
         close: candle.close.as_f64(),
+        volume: candle.volume,
         is_closed: true,
     }
 }
@@ -77,12 +108,13 @@ fn aggregate_bars(
     timeframe: Timeframe,
     source: &[Candle],
     limit: usize,
+    alignment: CandleAlignment,
 ) -> Vec<Bar> {
     let mut aggregated: Vec<Bar> = Vec::new();
 
     for candle in source {
         let start_at = candle.start_time.as_u64();
-        let Ok((bucket_start, bucket_end)) = bucket_bounds_ist(timeframe, start_at) else {
+        let Ok((bucket_start, bucket_end)) = bucket_bounds(timeframe, start_at, alignment) else {
             continue;
         };
         match aggregated.last_mut() {
@@ -90,6 +122,7 @@ fn aggregate_bars(
                 bar.high = bar.high.max(candle.high.as_f64());
                 bar.low = bar.low.min(candle.low.as_f64());
                 bar.close = candle.close.as_f64();
+                bar.volume += candle.volume;
                 bar.end_at = bucket_end;
             }
             _ => aggregated.push(Bar {
@@ -101,6 +134,7 @@ fn aggregate_bars(
                 high: candle.high.as_f64(),
                 low: candle.low.as_f64(),
                 close: candle.close.as_f64(),
+                volume: candle.volume,
                 is_closed: true,
             }),
         }
@@ -119,7 +153,10 @@ fn timeframe_factor(timeframe: Timeframe) -> usize {
         Timeframe::ThreeMinute => 3,
         Timeframe::FiveMinute => 5,
         Timeframe::FifteenMinute => 15,
+        Timeframe::ThirtyMinute => 30,
+        Timeframe::SeventyFiveMinute => 75,
         Timeframe::OneHour => 60,
-        Timeframe::OneDay => 1,
+        Timeframe::FourHour => 240,
+        Timeframe::OneDay => 1_440,
     }
 }

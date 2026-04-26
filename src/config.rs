@@ -13,6 +13,7 @@ pub struct AppConfig {
     pub brokers: BrokersSection,
     pub historical_candles: Option<HistoricalCandlesSection>,
     pub strategy: Option<StrategySection>,
+    pub backtest: Option<BacktestSection>,
     pub admin: Option<AdminSection>,
     pub master_scheduler: Option<MasterSchedulerSection>,
     pub channels: ChannelsSection,
@@ -129,6 +130,34 @@ pub struct StrategySection {
     pub recent_bars: usize,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct BacktestSection {
+    pub output_dir: Option<String>,
+    pub execution: Option<BacktestExecutionSection>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct BacktestExecutionSection {
+    #[serde(default)]
+    pub slippage_pct: f64,
+    #[serde(default)]
+    pub brokerage_pct: f64,
+    #[serde(default)]
+    pub entry_fee_pct: Option<f64>,
+    #[serde(default)]
+    pub exit_fee_pct: Option<f64>,
+    #[serde(default)]
+    pub fee_tax_pct: f64,
+    #[serde(default)]
+    pub fixed_fee_per_order: f64,
+    #[serde(default)]
+    pub funding_rate_pct: f64,
+    #[serde(default = "default_backtest_funding_interval_hours")]
+    pub funding_interval_hours: u64,
+    #[serde(default)]
+    pub funding_charge_mode: String,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct AdminSection {
     pub enabled: bool,
@@ -205,4 +234,8 @@ fn default_strategy_warmup_bars() -> usize {
 
 fn default_strategy_recent_bars() -> usize {
     512
+}
+
+fn default_backtest_funding_interval_hours() -> u64 {
+    8
 }
