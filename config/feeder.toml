@@ -110,7 +110,7 @@ historical_candles_sqlite_path = "runtime/backtest_historical_candles.sqlite"
 [historical_candles]
 enabled = true
 sqlite_path = "runtime/historical_candles.sqlite"
-one_minute_days = 90
+one_minute_days = 240
 one_day_days = 300
 maintenance_time_ist = "00:10"
 reconcile_one_minute_days = 2
@@ -119,8 +119,8 @@ reconcile_one_day_days = 5
 [strategy]
 enabled = true
 sqlite_path = "runtime/strategy.sqlite"
-warmup_bars = 512
-recent_bars = 512
+warmup_bars = 1000
+recent_bars = 1000
 
 [runtime]
 max_events = 0
