@@ -133,6 +133,7 @@ pub struct StrategySection {
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct BacktestSection {
     pub output_dir: Option<String>,
+    pub historical_candles_sqlite_path: Option<String>,
     pub execution: Option<BacktestExecutionSection>,
 }
 

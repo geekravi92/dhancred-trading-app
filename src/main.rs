@@ -1,10 +1,12 @@
 use std::env;
 use std::io::ErrorKind;
 
+use dhancred_trading_app::adapters::delta::historical::DeltaHistoricalClient;
+use dhancred_trading_app::adapters::historical::recover_spot_history;
 use dhancred_trading_app::adapters::run_feed_brokers;
 use dhancred_trading_app::admin::start_admin_server;
 use dhancred_trading_app::config::AppConfig;
-use dhancred_trading_app::feeder::FeedError;
+use dhancred_trading_app::feeder::{FeedError, InstrumentCatalog};
 use dhancred_trading_app::master_scheduler::start_master_scheduler;
 use dhancred_trading_app::notification::{
     AlertSeverity, init_notification_service, notify_failure,
@@ -48,11 +50,43 @@ fn run() -> Result<(), FeedError> {
         )));
     }
 
+    recover_live_history_before_strategy_warmup(&config)?;
+
     let strategy_runtime = start_strategy_runtime(&config)?;
     let _admin_server = start_admin_server(&config, strategy_runtime.clone())?;
     let _master_scheduler = start_master_scheduler(&config)?;
 
     run_feed_brokers(&config, strategy_runtime, configured_max_events(&config)?)
+}
+
+fn recover_live_history_before_strategy_warmup(config: &AppConfig) -> Result<(), FeedError> {
+    let Some(historical_config) = config
+        .historical_candles
+        .as_ref()
+        .filter(|historical| historical.enabled)
+    else {
+        return Ok(());
+    };
+
+    for broker in &config.feeder.feed_brokers {
+        if !broker.eq_ignore_ascii_case("DELTA") {
+            continue;
+        }
+
+        let Some(delta_config) = config.brokers.delta.as_ref().filter(|delta| delta.enabled) else {
+            continue;
+        };
+        let base_catalog = InstrumentCatalog::load_csv(&delta_config.base_instruments_csv)?;
+        let delta_historical = DeltaHistoricalClient::new(delta_config.rest_url()?);
+        recover_spot_history(
+            &delta_historical,
+            Some(historical_config),
+            &base_catalog,
+            delta_config.console_logging.unwrap_or(true),
+        )?;
+    }
+
+    Ok(())
 }
 
 fn configured_max_events(config: &AppConfig) -> Result<usize, FeedError> {

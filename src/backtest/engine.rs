@@ -80,6 +80,7 @@ pub fn run_backtest(request: BacktestRequest) -> Result<BacktestOutcome, Strateg
         .historical_candles
         .as_ref()
         .ok_or_else(|| StrategyError::Config("missing [historical_candles] config".to_string()))?;
+    let historical_sqlite_path = resolve_historical_sqlite_path(&config, historical_config);
 
     let execution = resolve_execution_config(&config, &request)?;
     execution.validate()?;
@@ -96,7 +97,7 @@ pub fn run_backtest(request: BacktestRequest) -> Result<BacktestOutcome, Strateg
         Arc::new(StaticSsuRepository { ssus: ssus.clone() }),
         Arc::new(BuiltinStrategyFactory),
         Arc::new(SqliteHistoricalReplayStore::with_alignments(
-            historical_config.sqlite_path.clone(),
+            historical_sqlite_path.clone(),
             candle_alignments.clone(),
         )) as Arc<dyn HistoricalReplayStore>,
         position_book.clone(),
@@ -110,7 +111,7 @@ pub fn run_backtest(request: BacktestRequest) -> Result<BacktestOutcome, Strateg
     runtime.reload_ssus()?;
 
     let feed = HistoricalCandleFeed::open_with_alignments(
-        &historical_config.sqlite_path,
+        &historical_sqlite_path,
         candle_alignments,
     )?;
     let warmup = feed.load_warmup_bars(&instruments, &timeframes, request.from, warmup_bars)?;
@@ -143,6 +144,17 @@ pub fn run_backtest(request: BacktestRequest) -> Result<BacktestOutcome, Strateg
     })?;
 
     Ok(outcome_from_report(report, warmup.len()))
+}
+
+fn resolve_historical_sqlite_path(
+    config: &AppConfig,
+    historical_config: &crate::config::HistoricalCandlesSection,
+) -> String {
+    config
+        .backtest
+        .as_ref()
+        .and_then(|backtest| backtest.historical_candles_sqlite_path.clone())
+        .unwrap_or_else(|| historical_config.sqlite_path.clone())
 }
 
 fn outcome_from_report(report: BacktestReportSummary, warmup_bars: usize) -> BacktestOutcome {

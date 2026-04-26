@@ -104,6 +104,9 @@ brokers = ["DELTA"]
 price_tick = true
 price_candles = []
 
+[backtest]
+historical_candles_sqlite_path = "runtime/backtest_historical_candles.sqlite"
+
 [historical_candles]
 enabled = true
 sqlite_path = "runtime/historical_candles.sqlite"
