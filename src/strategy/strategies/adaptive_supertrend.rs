@@ -3,6 +3,7 @@ use std::sync::Mutex;
 
 use serde::Deserialize;
 
+use crate::strategy::diagnostics;
 use crate::strategy::{
     Bar, PositionStatus, PriceUpdated, SignalSide, SsuConfig, Strategy, StrategyContext,
     StrategyError, StrategySignal, Timeframe, TimeframeUpdate,
@@ -46,6 +47,24 @@ impl Strategy for AdaptiveSupertrendStrategy {
         "adaptive_supertrend"
     }
 
+    fn warmup(
+        &self,
+        ctx: &StrategyContext,
+        ssu: &SsuConfig,
+        instrument: &str,
+    ) -> Result<(), StrategyError> {
+        let settings = self.settings_for(ssu)?;
+        let state_key = StateKey::new(ssu.ssu_id, instrument, settings.timeframe);
+        let mut states = self
+            .states
+            .lock()
+            .expect("adaptive supertrend state lock poisoned");
+        let state = states
+            .entry(state_key)
+            .or_insert_with(|| AdaptiveSupertrendState::new(&settings));
+        replay_warmup_bars(state, ctx, ssu, instrument, &settings, None)
+    }
+
     fn on_tick_updated(
         &self,
         ctx: &StrategyContext,
@@ -79,6 +98,7 @@ impl Strategy for AdaptiveSupertrendStrategy {
         let state_key = StateKey::new(ssu.ssu_id, &event.trigger_instrument, settings.timeframe);
         let Some(point) = self.advance_state(
             ctx,
+            ssu,
             &state_key,
             &settings,
             &closed_bar,
@@ -90,15 +110,44 @@ impl Strategy for AdaptiveSupertrendStrategy {
 
         let mut signals =
             self.manage_open_positions(ctx, ssu, event, &settings, &closed_bar, &point)?;
+        let exit_signal_count = signals.len();
+        let mut entry_reasons = Vec::new();
+        let mut entry_signal_emitted = false;
 
         if let Some(side) = point.entry_side {
             if settings.enabled_sides.contains(&side) {
-                if let Some(entry_signal) =
-                    self.try_open_entry(ctx, ssu, event, &settings, &closed_bar, &point, side)?
-                {
-                    signals.push(entry_signal);
+                entry_reasons = entry_block_reasons(&settings, &point);
+                if entry_reasons.is_empty() {
+                    if let Some(entry_signal) =
+                        self.try_open_entry(ctx, ssu, event, &settings, &closed_bar, &point, side)?
+                    {
+                        entry_signal_emitted = true;
+                        signals.push(entry_signal);
+                    } else {
+                        entry_reasons
+                            .push("entry_open_rejected:position_rule_or_invalid_risk".to_string());
+                    }
                 }
+            } else {
+                entry_reasons.push(format!("side_disabled:{}", side_label(side)));
             }
+        } else {
+            entry_reasons = no_entry_reasons(&settings, &point);
+        }
+
+        if diagnostics::closed_candle_decisions_enabled() {
+            log_closed_bar_decision(
+                "live",
+                ssu,
+                &event.trigger_instrument,
+                event.at,
+                &settings,
+                &closed_bar,
+                &point,
+                exit_signal_count,
+                entry_signal_emitted,
+                &entry_reasons,
+            );
         }
 
         Ok(signals)
@@ -128,6 +177,7 @@ impl AdaptiveSupertrendStrategy {
     fn advance_state(
         &self,
         ctx: &StrategyContext,
+        ssu: &SsuConfig,
         state_key: &StateKey,
         settings: &AdaptiveSupertrendSettings,
         closed_bar: &Bar,
@@ -149,17 +199,7 @@ impl AdaptiveSupertrendStrategy {
         }
 
         if state.is_empty() {
-            let bars = ctx.timeframes.recent_bars(
-                instrument,
-                settings.timeframe,
-                settings.state_capacity(),
-            );
-            for bar in bars
-                .into_iter()
-                .filter(|bar| bar.end_at < closed_bar.end_at)
-            {
-                state.on_closed_bar(&bar, settings, false)?;
-            }
+            replay_warmup_bars(state, ctx, ssu, instrument, settings, Some(closed_bar.end_at))?;
         }
 
         state.on_closed_bar(closed_bar, settings, true)
@@ -1275,6 +1315,7 @@ impl StateKey {
 struct IndicatorPoint {
     entry_side: Option<SignalSide>,
     flip_reason: &'static str,
+    prev_trend: i32,
     trend: i32,
     supertrend_line: f64,
     atr: f64,
@@ -1289,6 +1330,7 @@ struct IndicatorPoint {
     tp1_r: f64,
     tp2_r: f64,
     tp3_r: f64,
+    processed_bars: usize,
     pre_flip_trend_age: usize,
     last_pivot_high: Option<f64>,
     last_pivot_low: Option<f64>,
@@ -1538,6 +1580,7 @@ impl AdaptiveSupertrendState {
         let point = IndicatorPoint {
             entry_side,
             flip_reason,
+            prev_trend,
             trend: self.trend,
             supertrend_line: if self.trend == 1 { lower } else { upper },
             atr: atr_value,
@@ -1552,6 +1595,7 @@ impl AdaptiveSupertrendState {
             tp1_r,
             tp2_r,
             tp3_r,
+            processed_bars: self.processed_bars + 1,
             pre_flip_trend_age: trend_age,
             last_pivot_high: self.last_pivot_high,
             last_pivot_low: self.last_pivot_low,
@@ -2307,6 +2351,222 @@ fn side_label(side: SignalSide) -> &'static str {
     }
 }
 
+fn replay_warmup_bars(
+    state: &mut AdaptiveSupertrendState,
+    ctx: &StrategyContext,
+    ssu: &SsuConfig,
+    instrument: &str,
+    settings: &AdaptiveSupertrendSettings,
+    before_end: Option<u64>,
+) -> Result<(), StrategyError> {
+    if !state.is_empty() {
+        return Ok(());
+    }
+
+    let log_warmup = diagnostics::warmup_replay_enabled();
+    for bar in ctx
+        .timeframes
+        .recent_bars(instrument, settings.timeframe, settings.state_capacity())
+        .into_iter()
+        .filter(|bar| before_end.is_none_or(|end| bar.end_at < end))
+    {
+        let point = state.on_closed_bar(&bar, settings, log_warmup)?;
+        if log_warmup {
+            if let Some(point) = point {
+                let (would_emit, reasons) = diagnostic_entry_decision(settings, &point);
+                log_closed_bar_decision(
+                    "warmup",
+                    ssu,
+                    instrument,
+                    bar.end_at,
+                    settings,
+                    &bar,
+                    &point,
+                    0,
+                    would_emit,
+                    &reasons,
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn optional_side_label(side: Option<SignalSide>) -> &'static str {
+    match side {
+        Some(SignalSide::Long) => "long",
+        Some(SignalSide::Short) => "short",
+        None => "none",
+    }
+}
+
+fn trend_label(trend: i32) -> &'static str {
+    if trend == 1 { "bullish" } else { "bearish" }
+}
+
+fn no_entry_reasons(settings: &AdaptiveSupertrendSettings, point: &IndicatorPoint) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if point.processed_bars < settings.min_warmup_bars() {
+        reasons.push(format!(
+            "warmup:{}/{}",
+            point.processed_bars,
+            settings.min_warmup_bars()
+        ));
+    }
+    if point.flip_reason == "none" {
+        reasons.push("no_trend_flip".to_string());
+    } else if point.processed_bars < settings.min_warmup_bars() {
+        reasons.push(format!("flip_ignored_during_warmup:{}", point.flip_reason));
+    } else {
+        reasons.push(format!("flip_without_entry_side:{}", point.flip_reason));
+    }
+    reasons
+}
+
+fn entry_block_reasons(
+    settings: &AdaptiveSupertrendSettings,
+    point: &IndicatorPoint,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if point.atr <= 0.0 || !point.atr.is_finite() {
+        reasons.push(format!("invalid_atr:{:.6}", point.atr));
+    }
+    if point.tqi < settings.min_entry_tqi {
+        reasons.push(format!(
+            "tqi:{:.4}<min:{:.4}",
+            point.tqi, settings.min_entry_tqi
+        ));
+    }
+    if point.er < settings.min_entry_er {
+        reasons.push(format!(
+            "er:{:.4}<min:{:.4}",
+            point.er, settings.min_entry_er
+        ));
+    }
+    if point.tp_scale < settings.min_entry_tp_scale {
+        reasons.push(format!(
+            "tp_scale:{:.4}<min:{:.4}",
+            point.tp_scale, settings.min_entry_tp_scale
+        ));
+    }
+    if point.pre_flip_trend_age < settings.min_entry_trend_age {
+        reasons.push(format!(
+            "trend_age:{}<min:{}",
+            point.pre_flip_trend_age, settings.min_entry_trend_age
+        ));
+    }
+    if point.vol_ratio < settings.min_entry_vol_ratio {
+        reasons.push(format!(
+            "vol_ratio:{:.4}<min:{:.4}",
+            point.vol_ratio, settings.min_entry_vol_ratio
+        ));
+    }
+    if point.vol_ratio > settings.max_entry_vol_ratio {
+        reasons.push(format!(
+            "vol_ratio:{:.4}>max:{:.4}",
+            point.vol_ratio, settings.max_entry_vol_ratio
+        ));
+    }
+    reasons
+}
+
+fn diagnostic_entry_decision(
+    settings: &AdaptiveSupertrendSettings,
+    point: &IndicatorPoint,
+) -> (bool, Vec<String>) {
+    let Some(side) = point.entry_side else {
+        return (false, no_entry_reasons(settings, point));
+    };
+    if !settings.enabled_sides.contains(&side) {
+        return (false, vec![format!("side_disabled:{}", side_label(side))]);
+    }
+    let reasons = entry_block_reasons(settings, point);
+    (reasons.is_empty(), reasons)
+}
+
+fn log_closed_bar_decision(
+    phase: &str,
+    ssu: &SsuConfig,
+    instrument: &str,
+    at: u64,
+    settings: &AdaptiveSupertrendSettings,
+    closed_bar: &Bar,
+    point: &IndicatorPoint,
+    exit_signal_count: usize,
+    entry_signal_emitted: bool,
+    entry_reasons: &[String],
+) {
+    let decision = if phase == "warmup" && entry_signal_emitted {
+        "would_entry_signal"
+    } else if phase == "warmup" {
+        "would_no_signal"
+    } else if entry_signal_emitted && exit_signal_count > 0 {
+        "entry_and_exit_signal"
+    } else if entry_signal_emitted {
+        "entry_signal"
+    } else if exit_signal_count > 0 {
+        "exit_signal_no_new_entry"
+    } else {
+        "no_signal"
+    };
+    let reason_text = if entry_signal_emitted {
+        if phase == "warmup" {
+            "entry_conditions_met".to_string()
+        } else {
+            "entry_emitted".to_string()
+        }
+    } else if entry_reasons.is_empty() {
+        "none".to_string()
+    } else {
+        entry_reasons.join(",")
+    };
+
+    println!(
+        "ADAPTIVE_SUPERTREND_DECISION | phase={} | ssu={} | instrument={} | tf={} | bar_end={} | tick_at={} | ohlc={:.4}/{:.4}/{:.4}/{:.4} | decision={} | entry_side={} | exit_signals={} | reason={} | trend={}->{} | flip={} | warmup={}/{} | tqi={:.4} er={:.4} vol_ratio={:.4} tp_scale={:.4} trend_age={} | tqi_parts=er:{:.4},vol:{:.4},struct:{:.4},mom:{:.4} | filters=min_tqi:{:.4},min_er:{:.4},min_tp_scale:{:.4},min_trend_age:{},vol_range:{:.4}-{:.4} | atr={:.4} st_line={:.4} r={:.2}/{:.2}/{:.2} exit_mode={}",
+        phase,
+        ssu.ssu_id,
+        instrument,
+        timeframe_label(settings.timeframe),
+        closed_bar.end_at,
+        at,
+        closed_bar.open,
+        closed_bar.high,
+        closed_bar.low,
+        closed_bar.close,
+        decision,
+        optional_side_label(point.entry_side),
+        exit_signal_count,
+        reason_text,
+        trend_label(point.prev_trend),
+        trend_label(point.trend),
+        point.flip_reason,
+        point.processed_bars,
+        settings.min_warmup_bars(),
+        point.tqi,
+        point.er,
+        point.vol_ratio,
+        point.tp_scale,
+        point.pre_flip_trend_age,
+        point.tqi_er,
+        point.tqi_vol,
+        point.tqi_struct,
+        point.tqi_momentum,
+        settings.min_entry_tqi,
+        settings.min_entry_er,
+        settings.min_entry_tp_scale,
+        settings.min_entry_trend_age,
+        settings.min_entry_vol_ratio,
+        settings.max_entry_vol_ratio,
+        point.atr,
+        point.supertrend_line,
+        point.tp1_r,
+        point.tp2_r,
+        point.tp3_r,
+        exit_mode_label(settings.exit_mode),
+    );
+}
+
 fn exit_signal_label(side: SignalSide) -> &'static str {
     match side {
         SignalSide::Long => "EXIT_LONG",
@@ -2543,7 +2803,10 @@ mod tests {
             signals[0].metadata["evaluation_mode"].as_str(),
             Some("tick")
         );
-        assert_eq!(positions.list_open_by_ssu(ssu.ssu_id).expect("open").len(), 1);
+        assert_eq!(
+            positions.list_open_by_ssu(ssu.ssu_id).expect("open").len(),
+            1
+        );
         let updated = trade_contexts
             .load_context(&position.position_id)
             .expect("load")
@@ -2713,6 +2976,7 @@ mod tests {
         IndicatorPoint {
             entry_side: Some(SignalSide::Long),
             flip_reason: "price_flip",
+            prev_trend: -1,
             trend: 1,
             supertrend_line: 100.0,
             atr: 1.0,
@@ -2727,6 +2991,7 @@ mod tests {
             tp1_r: 1.0,
             tp2_r: 2.0,
             tp3_r: 3.0,
+            processed_bars: 100,
             pre_flip_trend_age,
             last_pivot_high: None,
             last_pivot_low: None,

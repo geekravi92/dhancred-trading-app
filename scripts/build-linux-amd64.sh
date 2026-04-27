@@ -30,6 +30,7 @@ mkdir -p "$PACKAGE_DIR/config/instruments/delta" "$PACKAGE_DIR/config/instrument
 
 cp "$TARGET_BIN" "$PACKAGE_DIR/dhancred-trading-app"
 cp config/feeder.toml "$PACKAGE_DIR/config/feeder.toml"
+cp config/strategy.toml "$PACKAGE_DIR/config/strategy.toml"
 cp config/instruments/delta/base_instruments.csv "$PACKAGE_DIR/config/instruments/delta/base_instruments.csv"
 cp config/instruments/fyers/base_instruments.csv "$PACKAGE_DIR/config/instruments/fyers/base_instruments.csv"
 cp deploy/systemd/dhancred-trading-app.service "$PACKAGE_DIR/deploy/systemd/dhancred-trading-app.service"

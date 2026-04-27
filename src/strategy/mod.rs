@@ -1,3 +1,4 @@
+pub(crate) mod diagnostics;
 mod error;
 mod history;
 mod price_store;

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -18,12 +18,18 @@ pub struct AppConfig {
     pub master_scheduler: Option<MasterSchedulerSection>,
     pub channels: ChannelsSection,
     pub runtime: Option<RuntimeSection>,
+    #[serde(skip)]
+    pub strategy_runtime: StrategyRuntimeConfig,
 }
 
 impl AppConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, FeedError> {
+        let path = path.as_ref();
         let content = fs::read_to_string(path)?;
-        toml::from_str(&content).map_err(|error| FeedError::Config(error.to_string()))
+        let mut config: Self =
+            toml::from_str(&content).map_err(|error| FeedError::Config(error.to_string()))?;
+        config.strategy_runtime = load_strategy_runtime_config(path)?;
+        Ok(config)
     }
 }
 
@@ -178,6 +184,20 @@ pub struct RuntimeSection {
     pub max_events: Option<usize>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct StrategyRuntimeConfig {
+    #[serde(default)]
+    pub diagnostics: StrategyDiagnosticsSection,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct StrategyDiagnosticsSection {
+    #[serde(default)]
+    pub closed_candle_decisions: bool,
+    #[serde(default)]
+    pub warmup_replay: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct InstrumentSelection {
     pub instrument_types: Vec<String>,
@@ -207,6 +227,53 @@ impl From<&FyersBrokerSection> for InstrumentSelection {
 
 fn env_from_name(name: &str) -> Result<String, FeedError> {
     env::var(name).map_err(|_| FeedError::Config(format!("missing environment variable {name}")))
+}
+
+fn load_strategy_runtime_config(
+    feeder_config_path: &Path,
+) -> Result<StrategyRuntimeConfig, FeedError> {
+    let path = env::var("STRATEGY_CONFIG_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            feeder_config_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("strategy.toml")
+        });
+    let mut config = match fs::read_to_string(&path) {
+        Ok(content) => toml::from_str::<StrategyRuntimeConfig>(&content).map_err(|error| {
+            FeedError::Config(format!("failed to parse {}: {error}", path.display()))
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            StrategyRuntimeConfig::default()
+        }
+        Err(error) => return Err(error.into()),
+    };
+    apply_strategy_env_overrides(&mut config)?;
+    Ok(config)
+}
+
+fn apply_strategy_env_overrides(config: &mut StrategyRuntimeConfig) -> Result<(), FeedError> {
+    if let Some(value) = optional_bool_env("STRATEGY_DIAGNOSTICS_CLOSED_CANDLE_DECISIONS")? {
+        config.diagnostics.closed_candle_decisions = value;
+    }
+    if let Some(value) = optional_bool_env("STRATEGY_DIAGNOSTICS_WARMUP_REPLAY")? {
+        config.diagnostics.warmup_replay = value;
+    }
+    Ok(())
+}
+
+fn optional_bool_env(name: &str) -> Result<Option<bool>, FeedError> {
+    let Ok(value) = env::var(name) else {
+        return Ok(None);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(Some(true)),
+        "0" | "false" | "no" | "off" => Ok(Some(false)),
+        other => Err(FeedError::Config(format!(
+            "invalid boolean env {name}={other}; expected true/false"
+        ))),
+    }
 }
 
 fn default_historical_one_minute_days() -> u32 {

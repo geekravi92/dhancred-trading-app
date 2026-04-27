@@ -72,8 +72,8 @@ impl HistoricalReplayStore for SqliteHistoricalReplayStore {
                         &instrument_name,
                         Timeframe::OneMinute,
                         limit
-                            .saturating_mul(timeframe_factor(timeframe))
-                            .saturating_add(8),
+                            .saturating_add(2)
+                            .saturating_mul(timeframe_factor(timeframe)),
                     )
                     .map_err(|error| StrategyError::Io(error.to_string()))?;
                 Ok(aggregate_bars(
@@ -140,11 +140,41 @@ fn aggregate_bars(
         }
     }
 
+    drop_incomplete_edge_buckets(&mut aggregated, source);
+
     if aggregated.len() > limit {
         aggregated.drain(0..aggregated.len() - limit);
     }
 
     aggregated
+}
+
+fn drop_incomplete_edge_buckets(aggregated: &mut Vec<Bar>, source: &[Candle]) {
+    if aggregated.is_empty() || source.is_empty() {
+        return;
+    }
+
+    let first_source_start = source
+        .first()
+        .map(|candle| candle.start_time.as_u64())
+        .unwrap_or_default();
+    if aggregated
+        .first()
+        .is_some_and(|bar| first_source_start > bar.start_at)
+    {
+        aggregated.remove(0);
+    }
+
+    let last_source_end = source
+        .last()
+        .map(|candle| candle.end_time.as_u64())
+        .unwrap_or_default();
+    if aggregated
+        .last()
+        .is_some_and(|bar| last_source_end < bar.end_at)
+    {
+        aggregated.pop();
+    }
 }
 
 fn timeframe_factor(timeframe: Timeframe) -> usize {
@@ -158,5 +188,61 @@ fn timeframe_factor(timeframe: Timeframe) -> usize {
         Timeframe::OneHour => 60,
         Timeframe::FourHour => 240,
         Timeframe::OneDay => 1_440,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::feeder::{InstrumentName, Price, UnixMillis};
+
+    const MINUTE: u64 = 60_000;
+
+    fn minute_candle(start_minute: u64, close: f64) -> Candle {
+        Candle::new(
+            InstrumentName::new("BTC"),
+            Timeframe::OneMinute,
+            UnixMillis::new(start_minute * MINUTE),
+            UnixMillis::new((start_minute + 1) * MINUTE),
+            Price::new(close).expect("open"),
+            Price::new(close + 1.0).expect("high"),
+            Price::new(close - 1.0).expect("low"),
+            Price::new(close).expect("close"),
+            0.0,
+        )
+    }
+
+    fn minute_source(start_minute: u64, end_minute_exclusive: u64) -> Vec<Candle> {
+        (start_minute..end_minute_exclusive)
+            .map(|minute| minute_candle(minute, 100.0 + minute as f64))
+            .collect()
+    }
+
+    #[test]
+    fn aggregated_warmup_drops_latest_incomplete_bucket() {
+        let source = minute_source(0, 40);
+        let bars = aggregate_bars("BTC", Timeframe::OneHour, &source, 10, CandleAlignment::UTC);
+
+        assert!(bars.is_empty());
+    }
+
+    #[test]
+    fn aggregated_warmup_keeps_only_completed_edge_buckets() {
+        let source = minute_source(0, 100);
+        let bars = aggregate_bars("BTC", Timeframe::OneHour, &source, 10, CandleAlignment::UTC);
+
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].start_at, 0);
+        assert_eq!(bars[0].end_at, 60 * MINUTE);
+    }
+
+    #[test]
+    fn aggregated_warmup_drops_oldest_incomplete_bucket() {
+        let source = minute_source(20, 120);
+        let bars = aggregate_bars("BTC", Timeframe::OneHour, &source, 10, CandleAlignment::UTC);
+
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].start_at, 60 * MINUTE);
+        assert_eq!(bars[0].end_at, 120 * MINUTE);
     }
 }

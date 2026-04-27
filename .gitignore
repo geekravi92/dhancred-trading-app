@@ -5,3 +5,4 @@
 .env
 .DS_Store
 backtests
+config/strategy.local.toml

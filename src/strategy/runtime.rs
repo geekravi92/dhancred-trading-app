@@ -42,6 +42,16 @@ pub struct StrategyPosition {
 
 pub trait Strategy: Send + Sync {
     fn strategy_key(&self) -> &'static str;
+
+    fn warmup(
+        &self,
+        _ctx: &StrategyContext,
+        _ssu: &SsuConfig,
+        _instrument: &str,
+    ) -> Result<(), StrategyError> {
+        Ok(())
+    }
+
     fn on_tick_updated(
         &self,
         _ctx: &StrategyContext,
@@ -868,6 +878,14 @@ impl StrategyRuntime {
                             .warmup(instrument, *timeframe, &bars, config.ssu_id)?;
                     }
                 }
+
+                let ctx = StrategyContext {
+                    prices: Arc::clone(&self.prices),
+                    timeframes: Arc::clone(&self.timeframes) as Arc<dyn TimeframeEngine>,
+                    strategy_positions: Arc::clone(&self.strategy_positions),
+                    trade_contexts: Arc::clone(&self.trade_contexts),
+                };
+                strategy.warmup(&ctx, &config, instrument)?;
             }
 
             loaded.push(LoadedSsu { config, strategy });
@@ -1049,6 +1067,7 @@ pub fn start_strategy_runtime(
         })?;
     let warmup_spot_instruments = load_spot_instruments(config)?;
     let candle_alignments = load_candle_alignments(config)?;
+    crate::strategy::diagnostics::configure(&config.strategy_runtime.diagnostics);
     let repository = Arc::new(SqliteSsuRepository::new(
         strategy_config.sqlite_path.clone(),
     )?);
@@ -1076,7 +1095,8 @@ pub fn start_strategy_runtime(
         strategy_config.recent_bars,
         candle_alignments,
     ));
-    let _ = runtime.reload_ssus()?;
+    let loaded_ssus = runtime.reload_ssus()?;
+    println!("Strategy runtime loaded: active_ssus={loaded_ssus}");
     Ok(Some(runtime))
 }
 
@@ -1509,6 +1529,44 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct WarmupCountingStrategy {
+        calls: Arc<AtomicUsize>,
+        bars_seen: Arc<AtomicUsize>,
+    }
+
+    impl Strategy for WarmupCountingStrategy {
+        fn strategy_key(&self) -> &'static str {
+            "warmup_counting"
+        }
+
+        fn warmup(
+            &self,
+            ctx: &StrategyContext,
+            _ssu: &SsuConfig,
+            instrument: &str,
+        ) -> Result<(), StrategyError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.bars_seen.fetch_add(
+                ctx.timeframes
+                    .recent_bars(instrument, Timeframe::FiveMinute, 64)
+                    .len(),
+                Ordering::Relaxed,
+            );
+            Ok(())
+        }
+
+        fn on_price_updated(
+            &self,
+            _ctx: &StrategyContext,
+            _ssu: &SsuConfig,
+            _event: &PriceUpdated,
+            _tf_update: &TimeframeUpdate,
+        ) -> Result<Vec<StrategySignal>, StrategyError> {
+            Ok(Vec::new())
+        }
+    }
+
     struct FakeFactory {
         strategy: Arc<dyn Strategy>,
     }
@@ -1586,6 +1644,52 @@ mod tests {
             .expect("tick");
 
         assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn runtime_calls_strategy_warmup_after_timeframe_warmup() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let bars_seen = Arc::new(AtomicUsize::new(0));
+        let runtime = StrategyRuntime::new(
+            Arc::new(FakeRepository {
+                ssus: vec![SsuConfig {
+                    ssu_id: 1,
+                    strategy_key: "warmup_counting".to_string(),
+                    enabled: true,
+                    trade_gap_secs: 0,
+                    max_overlap: 0,
+                    max_positions_per_day: 0,
+                    required_timeframes: vec![Timeframe::FiveMinute],
+                    indicator_specs: Vec::new(),
+                    params_json: "{}".to_string(),
+                }],
+            }),
+            Arc::new(FakeFactory {
+                strategy: Arc::new(WarmupCountingStrategy {
+                    calls: Arc::clone(&calls),
+                    bars_seen: Arc::clone(&bars_seen),
+                }),
+            }),
+            Arc::new(FakeHistorical),
+            Arc::new(
+                SqliteStrategyPositionBook::new(temp_sqlite("strategy-runtime-warmup"))
+                    .expect("positions"),
+            ),
+            Arc::new(
+                SqliteStrategyTradeContextStore::new(temp_sqlite("strategy-runtime-warmup-context"))
+                    .expect("contexts"),
+            ),
+            SignalRouter::new(vec![Arc::new(InMemorySignalSink::new())]),
+            vec!["NIFTY".to_string()],
+            32,
+            32,
+            CandleAlignmentMap::new(),
+        );
+
+        runtime.reload_ssus().expect("reload");
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(bars_seen.load(Ordering::Relaxed), 20);
     }
 
 }
