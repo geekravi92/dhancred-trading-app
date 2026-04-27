@@ -1,6 +1,6 @@
 [diagnostics]
 # Logs one line whenever a strategy evaluates a closed candle.
-closed_candle_decisions = false
+closed_candle_decisions = true
 
 # Replays and logs warmup bars. Keep this off on prod unless debugging.
 warmup_replay = false
