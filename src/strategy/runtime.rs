@@ -12,9 +12,10 @@ use crate::feeder::{
 use crate::notification::notify_message;
 use crate::storage::strategy::StrategySqlite;
 use crate::strategy::{
-    Bar, HistoricalReplayStore, InMemoryPriceStore, IndicatorSpec, PriceStore, PriceUpdated,
-    SharedTimeframeEngine, SignalSide, SsuConfig, StrategyContext, StrategyError, StrategySignal,
-    TimeframeEngine, TimeframeUpdate, instrument_kind_label, signal_type_label, trade_action_label,
+    Bar, CandleSnapshot, HistoricalReplayStore, InMemoryPriceStore, IndicatorSpec, MarketEvent,
+    PriceStore, SharedTimeframeEngine, SignalSide, SsuConfig, StrategyContext, StrategyError,
+    StrategySignal, Tick, TickSnapshot, TimedCandle, TimeframeEngine, TimeframeUpdate,
+    instrument_kind_label, signal_type_label, trade_action_label,
 };
 const IST_OFFSET_SECONDS: i32 = 5 * 60 * 60 + 30 * 60;
 
@@ -52,22 +53,11 @@ pub trait Strategy: Send + Sync {
         Ok(())
     }
 
-    fn on_tick_updated(
-        &self,
-        _ctx: &StrategyContext,
-        _ssu: &SsuConfig,
-        _event: &PriceUpdated,
-        _tf_update: &TimeframeUpdate,
-    ) -> Result<Vec<StrategySignal>, StrategyError> {
-        Ok(Vec::new())
-    }
-
-    fn on_price_updated(
+    fn on_market_event(
         &self,
         ctx: &StrategyContext,
         ssu: &SsuConfig,
-        event: &PriceUpdated,
-        tf_update: &TimeframeUpdate,
+        event: &MarketEvent,
     ) -> Result<Vec<StrategySignal>, StrategyError>;
 }
 
@@ -919,37 +909,25 @@ impl StrategyRuntime {
             return Ok(());
         }
 
-        let event = PriceUpdated {
-            trigger_instrument: instrument.to_string(),
-            at,
-        };
-        let ctx = StrategyContext {
-            prices: Arc::clone(&self.prices),
-            timeframes: Arc::clone(&self.timeframes) as Arc<dyn TimeframeEngine>,
-            strategy_positions: Arc::clone(&self.strategy_positions),
-            trade_contexts: Arc::clone(&self.trade_contexts),
-        };
-        let ssus = self
-            .active_ssus
-            .read()
-            .expect("active SSU lock poisoned")
-            .clone();
-        for loaded in ssus {
-            let tick_signals =
-                loaded
-                    .strategy
-                    .on_tick_updated(&ctx, &loaded.config, &event, &tf_update)?;
-            for signal in tick_signals {
-                self.signal_router.route(&signal)?;
-            }
+        let ctx = self.strategy_context();
+        let mut ticks = BTreeMap::new();
+        ticks.insert(
+            instrument.to_string(),
+            Tick {
+                price: ltp,
+                volume: 0.0,
+            },
+        );
+        self.dispatch_market_event(
+            &ctx,
+            &MarketEvent::Tick(TickSnapshot {
+                event_ts: at,
+                ticks,
+            }),
+        )?;
 
-            let signals =
-                loaded
-                    .strategy
-                    .on_price_updated(&ctx, &loaded.config, &event, &tf_update)?;
-            for signal in signals {
-                self.signal_router.route(&signal)?;
-            }
+        if let Some(snapshot) = self.candle_snapshot_from_update(&tf_update)? {
+            self.dispatch_market_event(&ctx, &MarketEvent::Candles(snapshot))?;
         }
 
         Ok(())
@@ -989,44 +967,64 @@ impl StrategyRuntime {
     }
 
     pub fn on_closed_bar(&self, bar: Bar, trigger_for_strategy: bool) -> Result<(), StrategyError> {
-        let instrument_lock = self.instrument_lock(&bar.instrument);
-        let _instrument_guard = instrument_lock.lock().expect("instrument lock poisoned");
+        self.on_closed_bars(std::slice::from_ref(&bar), trigger_for_strategy)
+    }
+
+    pub fn on_closed_bars(
+        &self,
+        bars: &[Bar],
+        trigger_for_strategy: bool,
+    ) -> Result<(), StrategyError> {
+        if bars.is_empty() {
+            return Ok(());
+        }
+
+        let event_ts = bars[0].end_at;
+        if bars.iter().any(|bar| bar.end_at != event_ts) {
+            return Err(StrategyError::Rule(
+                "closed-bar snapshot requires all candles to share the same end_at".to_string(),
+            ));
+        }
+
+        let instruments = bars
+            .iter()
+            .map(|bar| bar.instrument.as_str())
+            .collect::<BTreeSet<_>>();
+        let locks = instruments
+            .iter()
+            .map(|instrument| self.instrument_lock(instrument))
+            .collect::<Vec<_>>();
+        let _instrument_guards = locks
+            .iter()
+            .map(|lock| lock.lock().expect("instrument lock poisoned"))
+            .collect::<Vec<_>>();
         let _gate = self
             .lifecycle_gate
             .read()
             .expect("strategy lifecycle gate poisoned");
 
-        self.prices
-            .put_price(&bar.instrument, bar.close, bar.end_at);
-        let tf_update = self.timeframes.on_closed_bar(&bar)?;
-        if !trigger_for_strategy || tf_update.closed_timeframes.is_empty() {
+        let mut candles = BTreeMap::new();
+        for bar in bars {
+            self.prices
+                .put_price(&bar.instrument, bar.close, bar.end_at);
+            let tf_update = self.timeframes.on_closed_bar(bar)?;
+            if tf_update.closed_timeframes.contains(&bar.timeframe) {
+                candles
+                    .entry(bar.instrument.clone())
+                    .or_insert_with(BTreeMap::new)
+                    .insert(bar.timeframe, TimedCandle::from_bar(bar));
+            }
+        }
+
+        if !trigger_for_strategy || candles.is_empty() {
             return Ok(());
         }
 
-        let event = PriceUpdated {
-            trigger_instrument: bar.instrument.clone(),
-            at: bar.end_at,
-        };
-        let ctx = StrategyContext {
-            prices: Arc::clone(&self.prices),
-            timeframes: Arc::clone(&self.timeframes) as Arc<dyn TimeframeEngine>,
-            strategy_positions: Arc::clone(&self.strategy_positions),
-            trade_contexts: Arc::clone(&self.trade_contexts),
-        };
-        let ssus = self
-            .active_ssus
-            .read()
-            .expect("active SSU lock poisoned")
-            .clone();
-        for loaded in ssus {
-            let signals =
-                loaded
-                    .strategy
-                    .on_price_updated(&ctx, &loaded.config, &event, &tf_update)?;
-            for signal in signals {
-                self.signal_router.route(&signal)?;
-            }
-        }
+        let ctx = self.strategy_context();
+        self.dispatch_market_event(
+            &ctx,
+            &MarketEvent::Candles(CandleSnapshot { event_ts, candles }),
+        )?;
 
         Ok(())
     }
@@ -1036,6 +1034,66 @@ impl StrategyRuntime {
             .read()
             .expect("active SSU lock poisoned")
             .len()
+    }
+
+    fn strategy_context(&self) -> StrategyContext {
+        StrategyContext {
+            prices: Arc::clone(&self.prices),
+            timeframes: Arc::clone(&self.timeframes) as Arc<dyn TimeframeEngine>,
+            strategy_positions: Arc::clone(&self.strategy_positions),
+            trade_contexts: Arc::clone(&self.trade_contexts),
+        }
+    }
+
+    fn dispatch_market_event(
+        &self,
+        ctx: &StrategyContext,
+        event: &MarketEvent,
+    ) -> Result<(), StrategyError> {
+        let ssus = self
+            .active_ssus
+            .read()
+            .expect("active SSU lock poisoned")
+            .clone();
+        for loaded in ssus {
+            let signals = loaded
+                .strategy
+                .on_market_event(ctx, &loaded.config, event)?;
+            for signal in signals {
+                self.signal_router.route(&signal)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn candle_snapshot_from_update(
+        &self,
+        update: &TimeframeUpdate,
+    ) -> Result<Option<CandleSnapshot>, StrategyError> {
+        if update.closed_timeframes.is_empty() {
+            return Ok(None);
+        }
+
+        let mut candles = BTreeMap::new();
+        let mut event_ts = 0;
+        for timeframe in &update.closed_timeframes {
+            let Some(bar) = self
+                .timeframes
+                .last_closed_bar(&update.instrument, *timeframe)
+            else {
+                return Err(StrategyError::NotFound(format!(
+                    "missing closed candle for {} {:?} at {}",
+                    update.instrument, timeframe, update.tick_at
+                )));
+            };
+            event_ts = event_ts.max(bar.end_at);
+            candles
+                .entry(update.instrument.clone())
+                .or_insert_with(BTreeMap::new)
+                .insert(*timeframe, TimedCandle::from_bar(&bar));
+        }
+
+        Ok(Some(CandleSnapshot { event_ts, candles }))
     }
 
     fn instrument_lock(&self, instrument: &str) -> Arc<Mutex<()>> {
@@ -1517,14 +1575,37 @@ mod tests {
             "counting"
         }
 
-        fn on_price_updated(
+        fn on_market_event(
             &self,
             _ctx: &StrategyContext,
             _ssu: &SsuConfig,
-            _event: &PriceUpdated,
-            _tf_update: &TimeframeUpdate,
+            _event: &MarketEvent,
         ) -> Result<Vec<StrategySignal>, StrategyError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Vec::new())
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingStrategy {
+        events: Arc<Mutex<Vec<MarketEvent>>>,
+    }
+
+    impl Strategy for RecordingStrategy {
+        fn strategy_key(&self) -> &'static str {
+            "recording"
+        }
+
+        fn on_market_event(
+            &self,
+            _ctx: &StrategyContext,
+            _ssu: &SsuConfig,
+            event: &MarketEvent,
+        ) -> Result<Vec<StrategySignal>, StrategyError> {
+            self.events
+                .lock()
+                .expect("events lock poisoned")
+                .push(event.clone());
             Ok(Vec::new())
         }
     }
@@ -1556,12 +1637,11 @@ mod tests {
             Ok(())
         }
 
-        fn on_price_updated(
+        fn on_market_event(
             &self,
             _ctx: &StrategyContext,
             _ssu: &SsuConfig,
-            _event: &PriceUpdated,
-            _tf_update: &TimeframeUpdate,
+            _event: &MarketEvent,
         ) -> Result<Vec<StrategySignal>, StrategyError> {
             Ok(Vec::new())
         }
@@ -1647,6 +1727,70 @@ mod tests {
     }
 
     #[test]
+    fn runtime_candle_snapshot_event_ts_uses_closed_candle_end() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let runtime = StrategyRuntime::new(
+            Arc::new(FakeRepository {
+                ssus: vec![SsuConfig {
+                    ssu_id: 1,
+                    strategy_key: "recording".to_string(),
+                    enabled: true,
+                    trade_gap_secs: 0,
+                    max_overlap: 0,
+                    max_positions_per_day: 0,
+                    required_timeframes: vec![Timeframe::OneMinute],
+                    indicator_specs: Vec::new(),
+                    params_json: "{}".to_string(),
+                }],
+            }),
+            Arc::new(FakeFactory {
+                strategy: Arc::new(RecordingStrategy {
+                    events: Arc::clone(&events),
+                }),
+            }),
+            Arc::new(FakeHistorical),
+            Arc::new(
+                SqliteStrategyPositionBook::new(temp_sqlite("strategy-runtime-recording"))
+                    .expect("positions"),
+            ),
+            Arc::new(
+                SqliteStrategyTradeContextStore::new(temp_sqlite(
+                    "strategy-runtime-recording-context",
+                ))
+                .expect("contexts"),
+            ),
+            SignalRouter::new(Vec::new()),
+            Vec::new(),
+            0,
+            32,
+            CandleAlignmentMap::new(),
+        );
+
+        runtime.reload_ssus().expect("reload");
+        runtime.on_tick("NIFTY", 100.0, 10_000, true).expect("tick");
+        runtime
+            .on_tick("NIFTY", 101.0, 60_500, true)
+            .expect("rollover tick");
+
+        let events = events.lock().expect("events lock poisoned");
+        assert!(matches!(&events[0], MarketEvent::Tick(snapshot) if snapshot.event_ts == 10_000));
+        assert!(matches!(&events[1], MarketEvent::Tick(snapshot) if snapshot.event_ts == 60_500));
+        match &events[2] {
+            MarketEvent::Candles(snapshot) => {
+                assert_eq!(snapshot.event_ts, 60_000);
+                let candle = snapshot
+                    .candles
+                    .get("NIFTY")
+                    .and_then(|by_timeframe| by_timeframe.get(&Timeframe::OneMinute))
+                    .expect("one-minute candle");
+                assert_eq!(candle.start_ts, 0);
+                assert_eq!(candle.end_ts, 60_000);
+            }
+            MarketEvent::Tick(_) => panic!("expected candle snapshot"),
+        }
+    }
+
+    #[test]
     fn runtime_calls_strategy_warmup_after_timeframe_warmup() {
         let calls = Arc::new(AtomicUsize::new(0));
         let bars_seen = Arc::new(AtomicUsize::new(0));
@@ -1676,8 +1820,10 @@ mod tests {
                     .expect("positions"),
             ),
             Arc::new(
-                SqliteStrategyTradeContextStore::new(temp_sqlite("strategy-runtime-warmup-context"))
-                    .expect("contexts"),
+                SqliteStrategyTradeContextStore::new(temp_sqlite(
+                    "strategy-runtime-warmup-context",
+                ))
+                .expect("contexts"),
             ),
             SignalRouter::new(vec![Arc::new(InMemorySignalSink::new())]),
             vec!["NIFTY".to_string()],
@@ -1691,5 +1837,4 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(bars_seen.load(Ordering::Relaxed), 20);
     }
-
 }

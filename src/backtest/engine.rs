@@ -110,16 +110,20 @@ pub fn run_backtest(request: BacktestRequest) -> Result<BacktestOutcome, Strateg
     );
     runtime.reload_ssus()?;
 
-    let feed = HistoricalCandleFeed::open_with_alignments(
-        &historical_sqlite_path,
-        candle_alignments,
-    )?;
+    let feed =
+        HistoricalCandleFeed::open_with_alignments(&historical_sqlite_path, candle_alignments)?;
     let warmup = feed.load_warmup_bars(&instruments, &timeframes, request.from, warmup_bars)?;
     runtime.warmup_closed_bars(&warmup)?;
 
     let replay = feed.load_replay_bars(&instruments, &timeframes, request.from, request.to)?;
-    for bar in &replay {
-        runtime.on_closed_bar(bar.clone(), true)?;
+    let mut index = 0;
+    while index < replay.len() {
+        let end_at = replay[index].end_at;
+        let start = index;
+        while index < replay.len() && replay[index].end_at == end_at {
+            index += 1;
+        }
+        runtime.on_closed_bars(&replay[start..index], true)?;
     }
 
     let report = write_report(BacktestReportInput {

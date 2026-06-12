@@ -7,6 +7,7 @@ mod signal;
 mod strategies;
 mod timeframes;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub use error::StrategyError;
@@ -36,12 +37,6 @@ pub struct PriceSnapshot {
     pub updated_at: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PriceUpdated {
-    pub trigger_instrument: String,
-    pub at: u64,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct Bar {
     pub instrument: String,
@@ -54,6 +49,71 @@ pub struct Bar {
     pub close: f64,
     pub volume: f64,
     pub is_closed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Candle {
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimedCandle {
+    pub start_ts: u64,
+    pub end_ts: u64,
+    pub candle: Candle,
+}
+
+impl TimedCandle {
+    pub fn from_bar(bar: &Bar) -> Self {
+        Self {
+            start_ts: bar.start_at,
+            end_ts: bar.end_at,
+            candle: Candle {
+                open: bar.open,
+                high: bar.high,
+                low: bar.low,
+                close: bar.close,
+                volume: bar.volume,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tick {
+    pub price: f64,
+    pub volume: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TickSnapshot {
+    pub event_ts: u64,
+    pub ticks: BTreeMap<String, Tick>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CandleSnapshot {
+    pub event_ts: u64,
+    pub candles: BTreeMap<String, BTreeMap<Timeframe, TimedCandle>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MarketEvent {
+    Tick(TickSnapshot),
+    Candles(CandleSnapshot),
+}
+
+impl MarketEvent {
+    pub fn event_ts(&self) -> u64 {
+        match self {
+            MarketEvent::Tick(snapshot) => snapshot.event_ts,
+            MarketEvent::Candles(snapshot) => snapshot.event_ts,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

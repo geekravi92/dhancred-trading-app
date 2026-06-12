@@ -5,8 +5,8 @@ use serde::Deserialize;
 
 use crate::strategy::diagnostics;
 use crate::strategy::{
-    Bar, PositionStatus, PriceUpdated, SignalSide, SsuConfig, Strategy, StrategyContext,
-    StrategyError, StrategySignal, Timeframe, TimeframeUpdate,
+    Bar, CandleSnapshot, MarketEvent, PositionStatus, SignalSide, SsuConfig, Strategy,
+    StrategyContext, StrategyError, StrategySignal, TickSnapshot, TimedCandle, Timeframe,
 };
 
 const WARMUP_FLOOR: usize = 50;
@@ -65,96 +65,117 @@ impl Strategy for AdaptiveSupertrendStrategy {
         replay_warmup_bars(state, ctx, ssu, instrument, &settings, None)
     }
 
-    fn on_tick_updated(
+    fn on_market_event(
         &self,
         ctx: &StrategyContext,
         ssu: &SsuConfig,
-        event: &PriceUpdated,
-        _tf_update: &TimeframeUpdate,
+        event: &MarketEvent,
     ) -> Result<Vec<StrategySignal>, StrategyError> {
         let settings = self.settings_for(ssu)?;
-        self.manage_open_positions_on_tick(ctx, ssu, event, &settings)
-    }
-
-    fn on_price_updated(
-        &self,
-        ctx: &StrategyContext,
-        ssu: &SsuConfig,
-        event: &PriceUpdated,
-        tf_update: &TimeframeUpdate,
-    ) -> Result<Vec<StrategySignal>, StrategyError> {
-        let settings = self.settings_for(ssu)?;
-        if !tf_update.closed_timeframes.contains(&settings.timeframe) {
-            return Ok(Vec::new());
-        }
-
-        let Some(closed_bar) = ctx
-            .timeframes
-            .last_closed_bar(&event.trigger_instrument, settings.timeframe)
-        else {
-            return Ok(Vec::new());
-        };
-
-        let state_key = StateKey::new(ssu.ssu_id, &event.trigger_instrument, settings.timeframe);
-        let Some(point) = self.advance_state(
-            ctx,
-            ssu,
-            &state_key,
-            &settings,
-            &closed_bar,
-            &event.trigger_instrument,
-        )?
-        else {
-            return Ok(Vec::new());
-        };
-
-        let mut signals =
-            self.manage_open_positions(ctx, ssu, event, &settings, &closed_bar, &point)?;
-        let exit_signal_count = signals.len();
-        let mut entry_reasons = Vec::new();
-        let mut entry_signal_emitted = false;
-
-        if let Some(side) = point.entry_side {
-            if settings.enabled_sides.contains(&side) {
-                entry_reasons = entry_block_reasons(&settings, &point);
-                if entry_reasons.is_empty() {
-                    if let Some(entry_signal) =
-                        self.try_open_entry(ctx, ssu, event, &settings, &closed_bar, &point, side)?
-                    {
-                        entry_signal_emitted = true;
-                        signals.push(entry_signal);
-                    } else {
-                        entry_reasons
-                            .push("entry_open_rejected:position_rule_or_invalid_risk".to_string());
-                    }
-                }
-            } else {
-                entry_reasons.push(format!("side_disabled:{}", side_label(side)));
+        match event {
+            MarketEvent::Tick(snapshot) => self.on_tick_snapshot(ctx, ssu, snapshot, &settings),
+            MarketEvent::Candles(snapshot) => {
+                self.on_candle_snapshot(ctx, ssu, snapshot, &settings)
             }
-        } else {
-            entry_reasons = no_entry_reasons(&settings, &point);
         }
-
-        if diagnostics::closed_candle_decisions_enabled() {
-            log_closed_bar_decision(
-                "live",
-                ssu,
-                &event.trigger_instrument,
-                event.at,
-                &settings,
-                &closed_bar,
-                &point,
-                exit_signal_count,
-                entry_signal_emitted,
-                &entry_reasons,
-            );
-        }
-
-        Ok(signals)
     }
 }
 
 impl AdaptiveSupertrendStrategy {
+    fn on_tick_snapshot(
+        &self,
+        ctx: &StrategyContext,
+        ssu: &SsuConfig,
+        snapshot: &TickSnapshot,
+        settings: &AdaptiveSupertrendSettings,
+    ) -> Result<Vec<StrategySignal>, StrategyError> {
+        let mut signals = Vec::new();
+        for (instrument, tick) in &snapshot.ticks {
+            signals.extend(self.manage_open_positions_on_tick(
+                ctx,
+                ssu,
+                instrument,
+                snapshot.event_ts,
+                tick.price,
+                settings,
+            )?);
+        }
+        Ok(signals)
+    }
+
+    fn on_candle_snapshot(
+        &self,
+        ctx: &StrategyContext,
+        ssu: &SsuConfig,
+        snapshot: &CandleSnapshot,
+        settings: &AdaptiveSupertrendSettings,
+    ) -> Result<Vec<StrategySignal>, StrategyError> {
+        let mut all_signals = Vec::new();
+        for (instrument, candles_by_timeframe) in &snapshot.candles {
+            let Some(timed_candle) = candles_by_timeframe.get(&settings.timeframe) else {
+                continue;
+            };
+            let closed_bar = bar_from_timed_candle(instrument, settings.timeframe, timed_candle);
+            let state_key = StateKey::new(ssu.ssu_id, instrument, settings.timeframe);
+            let Some(point) =
+                self.advance_state(ctx, ssu, &state_key, settings, &closed_bar, instrument)?
+            else {
+                continue;
+            };
+
+            let mut signals =
+                self.manage_open_positions(ctx, ssu, instrument, settings, &closed_bar, &point)?;
+            let exit_signal_count = signals.len();
+            let mut entry_reasons = Vec::new();
+            let mut entry_signal_emitted = false;
+
+            if let Some(side) = point.entry_side {
+                if settings.enabled_sides.contains(&side) {
+                    entry_reasons = entry_block_reasons(settings, &point);
+                    if entry_reasons.is_empty() {
+                        if let Some(entry_signal) = self.try_open_entry(
+                            ctx,
+                            ssu,
+                            instrument,
+                            settings,
+                            &closed_bar,
+                            &point,
+                            side,
+                        )? {
+                            entry_signal_emitted = true;
+                            signals.push(entry_signal);
+                        } else {
+                            entry_reasons.push(
+                                "entry_open_rejected:position_rule_or_invalid_risk".to_string(),
+                            );
+                        }
+                    }
+                } else {
+                    entry_reasons.push(format!("side_disabled:{}", side_label(side)));
+                }
+            } else {
+                entry_reasons = no_entry_reasons(settings, &point);
+            }
+
+            if diagnostics::closed_candle_decisions_enabled() {
+                log_closed_bar_decision(
+                    "market_event",
+                    ssu,
+                    instrument,
+                    snapshot.event_ts,
+                    settings,
+                    &closed_bar,
+                    &point,
+                    exit_signal_count,
+                    entry_signal_emitted,
+                    &entry_reasons,
+                );
+            }
+            all_signals.extend(signals);
+        }
+        Ok(all_signals)
+    }
+
     fn settings_for(&self, ssu: &SsuConfig) -> Result<AdaptiveSupertrendSettings, StrategyError> {
         if let Some(settings) = self
             .settings
@@ -199,7 +220,14 @@ impl AdaptiveSupertrendStrategy {
         }
 
         if state.is_empty() {
-            replay_warmup_bars(state, ctx, ssu, instrument, settings, Some(closed_bar.end_at))?;
+            replay_warmup_bars(
+                state,
+                ctx,
+                ssu,
+                instrument,
+                settings,
+                Some(closed_bar.end_at),
+            )?;
         }
 
         state.on_closed_bar(closed_bar, settings, true)
@@ -209,13 +237,11 @@ impl AdaptiveSupertrendStrategy {
         &self,
         ctx: &StrategyContext,
         ssu: &SsuConfig,
-        event: &PriceUpdated,
+        instrument: &str,
+        at: u64,
+        tick_price: f64,
         settings: &AdaptiveSupertrendSettings,
     ) -> Result<Vec<StrategySignal>, StrategyError> {
-        let Some(snapshot) = ctx.prices.get_price(&event.trigger_instrument) else {
-            return Ok(Vec::new());
-        };
-        let tick_price = snapshot.ltp;
         if !tick_price.is_finite() || tick_price <= 0.0 {
             return Ok(Vec::new());
         }
@@ -224,7 +250,7 @@ impl AdaptiveSupertrendStrategy {
         let open_positions = ctx.strategy_positions.list_open_by_ssu(ssu.ssu_id)?;
         for position in open_positions
             .into_iter()
-            .filter(|position| position.trade_instrument == event.trigger_instrument)
+            .filter(|position| position.trade_instrument == instrument)
             .filter(|position| position.status == PositionStatus::Open)
         {
             let Some(mut metadata) = ctx.trade_contexts.load_context(&position.position_id)? else {
@@ -246,7 +272,7 @@ impl AdaptiveSupertrendStrategy {
             let mut hit_tp2 = required_bool(&metadata, "hit_tp2")?;
             let mut hit_tp3 = required_bool(&metadata, "hit_tp3")?;
 
-            if event.at <= entry_bar_end_at {
+            if at <= entry_bar_end_at {
                 continue;
             }
 
@@ -264,8 +290,7 @@ impl AdaptiveSupertrendStrategy {
                 } else {
                     let mut remaining_fraction = partial_book_remaining_fraction(hit_tp1, hit_tp2);
                     if !hit_tp1 && price_reached(position.side, tick_price, tp1_price) {
-                        let remaining_after =
-                            (remaining_fraction - PARTIAL_EXIT_FRACTION).max(0.0);
+                        let remaining_after = (remaining_fraction - PARTIAL_EXIT_FRACTION).max(0.0);
                         partial_plans.push(PartialExitPlan {
                             level: "tp1",
                             price: tp1_price,
@@ -280,8 +305,7 @@ impl AdaptiveSupertrendStrategy {
                         hit_tp1 = true;
                     }
                     if !hit_tp2 && price_reached(position.side, tick_price, tp2_price) {
-                        let remaining_after =
-                            (remaining_fraction - PARTIAL_EXIT_FRACTION).max(0.0);
+                        let remaining_after = (remaining_fraction - PARTIAL_EXIT_FRACTION).max(0.0);
                         partial_plans.push(PartialExitPlan {
                             level: "tp2",
                             price: tp2_price,
@@ -347,14 +371,14 @@ impl AdaptiveSupertrendStrategy {
             metadata["hit_tp3"] = serde_json::json!(hit_tp3);
             metadata["active_stop_price"] = serde_json::json!(active_stop_price);
             metadata["last_tick_price"] = serde_json::json!(tick_price);
-            metadata["last_tick_at"] = serde_json::json!(event.at);
+            metadata["last_tick_at"] = serde_json::json!(at);
 
             for partial in partial_plans {
                 let position_id = position.position_id.clone();
                 let mut signal = StrategySignal::single_leg_partial_exit(
                     ssu.ssu_id,
                     self.strategy_key(),
-                    &event.trigger_instrument,
+                    instrument,
                     position.side,
                     partial.price,
                     partial.fraction,
@@ -362,14 +386,14 @@ impl AdaptiveSupertrendStrategy {
                         "adaptive_supertrend_partial_exit|level={}|mode=tick|tf={}|tick_at={}",
                         partial.level,
                         timeframe_label(settings.timeframe),
-                        event.at
+                        at
                     ),
-                    event.at,
+                    at,
                 );
                 signal.signal_id = format!(
                     "SIG-{}-{}-{}-{}-{}",
                     ssu.ssu_id,
-                    event.at,
+                    at,
                     partial_exit_signal_label(position.side),
                     partial.level.to_ascii_uppercase(),
                     position_id
@@ -394,7 +418,7 @@ impl AdaptiveSupertrendStrategy {
                     "exit_reason": format!("{}_partial", partial.level),
                     "exit_mode": exit_mode_label(settings.exit_mode),
                     "position_id": position_id.clone(),
-                    "tick_at": event.at,
+                    "tick_at": at,
                     "partial_level": partial.level,
                     "exit_fraction": partial.fraction,
                     "remaining_fraction_before": partial.remaining_before,
@@ -417,21 +441,21 @@ impl AdaptiveSupertrendStrategy {
                 let mut signal = StrategySignal::single_leg_exit(
                     ssu.ssu_id,
                     self.strategy_key(),
-                    &event.trigger_instrument,
+                    instrument,
                     position.side,
                     plan.price,
                     format!(
                         "adaptive_supertrend_exit|reason={}|mode=tick|tf={}|tick_at={}",
                         plan.reason,
                         timeframe_label(settings.timeframe),
-                        event.at
+                        at
                     ),
-                    event.at,
+                    at,
                 );
                 signal.signal_id = format!(
                     "SIG-{}-{}-{}-{}",
                     ssu.ssu_id,
-                    event.at,
+                    at,
                     exit_signal_label(position.side),
                     position.position_id
                 );
@@ -442,7 +466,7 @@ impl AdaptiveSupertrendStrategy {
                     "exit_reason": plan.reason,
                     "exit_mode": exit_mode_label(settings.exit_mode),
                     "position_id": position.position_id,
-                    "tick_at": event.at,
+                    "tick_at": at,
                     "realized_r": plan.realized_r,
                     "hit_tp1": hit_tp1,
                     "hit_tp2": hit_tp2,
@@ -462,7 +486,7 @@ impl AdaptiveSupertrendStrategy {
                 }
             } else if !signals.is_empty() || hit_tp1 || hit_tp2 || hit_tp3 {
                 ctx.trade_contexts
-                    .update_context(&position.position_id, &metadata, event.at)?;
+                    .update_context(&position.position_id, &metadata, at)?;
             }
         }
 
@@ -473,7 +497,7 @@ impl AdaptiveSupertrendStrategy {
         &self,
         ctx: &StrategyContext,
         ssu: &SsuConfig,
-        event: &PriceUpdated,
+        instrument: &str,
         settings: &AdaptiveSupertrendSettings,
         closed_bar: &Bar,
         point: &IndicatorPoint,
@@ -482,7 +506,7 @@ impl AdaptiveSupertrendStrategy {
         let open_positions = ctx.strategy_positions.list_open_by_ssu(ssu.ssu_id)?;
         for position in open_positions
             .into_iter()
-            .filter(|position| position.trade_instrument == event.trigger_instrument)
+            .filter(|position| position.trade_instrument == instrument)
             .filter(|position| position.status == PositionStatus::Open)
         {
             let Some(mut metadata) = ctx.trade_contexts.load_context(&position.position_id)? else {
@@ -730,7 +754,7 @@ impl AdaptiveSupertrendStrategy {
                 let mut signal = StrategySignal::single_leg_partial_exit(
                     ssu.ssu_id,
                     self.strategy_key(),
-                    &event.trigger_instrument,
+                    instrument,
                     position.side,
                     partial.price,
                     partial.fraction,
@@ -791,7 +815,7 @@ impl AdaptiveSupertrendStrategy {
                 let mut signal = StrategySignal::single_leg_exit(
                     ssu.ssu_id,
                     self.strategy_key(),
-                    &event.trigger_instrument,
+                    instrument,
                     position.side,
                     plan.price,
                     format!(
@@ -848,7 +872,7 @@ impl AdaptiveSupertrendStrategy {
         &self,
         ctx: &StrategyContext,
         ssu: &SsuConfig,
-        event: &PriceUpdated,
+        instrument: &str,
         settings: &AdaptiveSupertrendSettings,
         closed_bar: &Bar,
         point: &IndicatorPoint,
@@ -891,7 +915,7 @@ impl AdaptiveSupertrendStrategy {
         let mut signal = StrategySignal::single_leg_entry(
             ssu.ssu_id,
             self.strategy_key(),
-            &event.trigger_instrument,
+            instrument,
             side,
             entry_price,
             format!(
@@ -979,12 +1003,31 @@ impl AdaptiveSupertrendStrategy {
             &position.position_id,
             ssu.ssu_id,
             self.strategy_key(),
-            &event.trigger_instrument,
+            instrument,
             &metadata,
             closed_bar.end_at,
         )?;
 
         Ok(Some(signal))
+    }
+}
+
+fn bar_from_timed_candle(
+    instrument: &str,
+    timeframe: Timeframe,
+    timed_candle: &TimedCandle,
+) -> Bar {
+    Bar {
+        instrument: instrument.to_string(),
+        timeframe,
+        start_at: timed_candle.start_ts,
+        end_at: timed_candle.end_ts,
+        open: timed_candle.candle.open,
+        high: timed_candle.candle.high,
+        low: timed_candle.candle.low,
+        close: timed_candle.candle.close,
+        volume: timed_candle.candle.volume,
+        is_closed: true,
     }
 }
 
@@ -2375,15 +2418,7 @@ fn replay_warmup_bars(
             if let Some(point) = point {
                 let (would_emit, reasons) = diagnostic_entry_decision(settings, &point);
                 log_closed_bar_decision(
-                    "warmup",
-                    ssu,
-                    instrument,
-                    bar.end_at,
-                    settings,
-                    &bar,
-                    &point,
-                    0,
-                    would_emit,
+                    "warmup", ssu, instrument, bar.end_at, settings, &bar, &point, 0, would_emit,
                     &reasons,
                 );
             }
@@ -2783,19 +2818,20 @@ mod tests {
             strategy_positions: positions.clone() as Arc<dyn StrategyPositionBook>,
             trade_contexts: trade_contexts.clone() as Arc<dyn StrategyTradeContextStore>,
         };
-        let event = PriceUpdated {
-            trigger_instrument: "BTCUSD".to_string(),
-            at: 2_000,
-        };
-        let update = TimeframeUpdate {
-            instrument: "BTCUSD".to_string(),
-            tick_at: 2_000,
-            closed_timeframes: Vec::new(),
-        };
+        let mut ticks = std::collections::BTreeMap::new();
+        ticks.insert(
+            "BTCUSD".to_string(),
+            crate::strategy::Tick {
+                price: 110.0,
+                volume: 0.0,
+            },
+        );
+        let event = MarketEvent::Tick(TickSnapshot {
+            event_ts: 2_000,
+            ticks,
+        });
 
-        let signals = strategy
-            .on_tick_updated(&ctx, &ssu, &event, &update)
-            .expect("tick");
+        let signals = strategy.on_market_event(&ctx, &ssu, &event).expect("tick");
 
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].signal_type, StrategySignalType::ExitLongPartial);
