@@ -1,0 +1,60 @@
+base_instruments_csv = "config/instruments/fyers/base_instruments.csv"
+derivatives_csv = "data/instruments/fyers/derivatives.csv"
+master_data_dir = "data/instruments/fyers/master"
+instrument_types = ["FUT", "CALL", "PUT"]
+strike_distance_pct = 2.0
+refresh_trigger_pct = 1.5
+data_ws_url = "wss://socket.fyers.in/hsm/v1-5/prod"
+access_token_file = "runtime/secrets/fyers_access_token"
+app_id_env = "FYERS_APP_ID"
+latest_prices_file = "runtime/fyers_latest_prices.txt"
+console_logging = false
+
+[master_urls]
+NSE_CD = "https://public.fyers.in/sym_details/NSE_CD_sym_master.json"
+NSE_FO = "https://public.fyers.in/sym_details/NSE_FO_sym_master.json"
+NSE_COM = "https://public.fyers.in/sym_details/NSE_COM_sym_master.json"
+NSE_CM = "https://public.fyers.in/sym_details/NSE_CM_sym_master.json"
+BSE_CM = "https://public.fyers.in/sym_details/BSE_CM_sym_master.json"
+BSE_FO = "https://public.fyers.in/sym_details/BSE_FO_sym_master.json"
+MCX_COM = "https://public.fyers.in/sym_details/MCX_COM_sym_master.json"
+
+[[market_sessions]]
+name = "NSE_BSE_EQUITY"
+timezone = "Asia/Kolkata"
+open_ist = "09:15"
+close_ist = "15:30"
+connect_before_open_secs = 300
+weekdays_only = true
+
+[[market_sessions]]
+name = "INDIA_CURRENCY"
+timezone = "Asia/Kolkata"
+open_ist = "09:00"
+close_ist = "17:00"
+connect_before_open_secs = 300
+weekdays_only = true
+
+[[market_sessions]]
+name = "INDIA_AGRI_COMMODITY"
+timezone = "Asia/Kolkata"
+open_ist = "09:00"
+close_ist = "17:00"
+connect_before_open_secs = 300
+weekdays_only = true
+
+[[market_sessions]]
+name = "INDIA_INTL_AGRI_COMMODITY"
+timezone = "Asia/Kolkata"
+open_ist = "09:00"
+close_ist = "21:00"
+connect_before_open_secs = 300
+weekdays_only = true
+
+[[market_sessions]]
+name = "INDIA_NON_AGRI_COMMODITY"
+timezone = "Asia/Kolkata"
+open_ist = "09:00"
+close_ist = "23:30"
+connect_before_open_secs = 300
+weekdays_only = true

@@ -1,0 +1,19 @@
+/target/
+tests/js
+**/node_modules
+
+# OS-specific files
+.DS_Store
+.env
+ehthumbs.db
+Icon?
+Thumbs.db
+
+# IDE-specific files
+.idea/         # IntelliJ/RustRover project files
+.vscode/       # VS Code settings
+*.iml          # IntelliJ project files
+.build/
+
+# Cargo lock file (only for libraries)
+Cargo.lock

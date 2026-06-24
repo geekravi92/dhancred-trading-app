@@ -5,17 +5,29 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::adapters::dbinternational::auth::{
+    DbinternationalLoginSummary, login_all, login_interactive, login_market_data,
+};
 use crate::adapters::fyers::token::write_access_token;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, DbinternationalBrokerSection};
 use crate::feeder::FeedError;
 use crate::strategy::StrategyRuntimeHandle;
 
+const DBINTERNATIONAL_LOGIN_PATH: &str = "/admin/dbinternational/login";
+const DBINTERNATIONAL_MARKET_DATA_LOGIN_PATH: &str = "/admin/dbinternational/login/market-data";
+const DBINTERNATIONAL_INTERACTIVE_LOGIN_PATH: &str = "/admin/dbinternational/login/interactive";
 const FYERS_ACCESS_TOKEN_PATH: &str = "/admin/fyers/access-token";
 const STRATEGY_RELOAD_PATH: &str = "/admin/strategy/reload";
 const MAX_REQUEST_BYTES: usize = 16 * 1024;
 
 pub struct AdminServerHandle {
     _handle: JoinHandle<()>,
+}
+
+struct AdminState {
+    fyers_access_token_file: Option<String>,
+    dbinternational: Option<DbinternationalBrokerSection>,
+    strategy_runtime: Option<Arc<StrategyRuntimeHandle>>,
 }
 
 pub fn start_admin_server(
@@ -41,11 +53,15 @@ pub fn start_admin_server(
         )));
     }
 
-    let fyers_config =
-        config.brokers.fyers.clone().ok_or_else(|| {
-            FeedError::Config("admin API requires brokers.fyers config".to_string())
-        })?;
-    let access_token_file = fyers_config.access_token_file;
+    let state = AdminState {
+        fyers_access_token_file: config
+            .brokers
+            .fyers
+            .as_ref()
+            .map(|config| config.access_token_file.clone()),
+        dbinternational: config.brokers.dbinternational.clone(),
+        strategy_runtime,
+    };
     let listener = TcpListener::bind(bind_addr)?;
 
     println!("Admin API listening on http://{bind_addr}");
@@ -53,9 +69,7 @@ pub fn start_admin_server(
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    if let Err(error) =
-                        handle_connection(stream, &access_token_file, strategy_runtime.as_ref())
-                    {
+                    if let Err(error) = handle_connection(stream, &state) {
                         eprintln!("admin API request failed: {error}");
                     }
                 }
@@ -67,22 +81,45 @@ pub fn start_admin_server(
     Ok(Some(AdminServerHandle { _handle: handle }))
 }
 
-fn handle_connection(
-    mut stream: TcpStream,
-    access_token_file: &str,
-    strategy_runtime: Option<&Arc<StrategyRuntimeHandle>>,
-) -> Result<(), FeedError> {
+fn handle_connection(mut stream: TcpStream, state: &AdminState) -> Result<(), FeedError> {
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     let request = read_http_request(&mut stream)?;
 
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/health") => write_response(&mut stream, 200, "ok\n"),
         ("POST", FYERS_ACCESS_TOKEN_PATH) => {
+            let Some(access_token_file) = state.fyers_access_token_file.as_deref() else {
+                return write_response(&mut stream, 404, "FYERS config disabled\n");
+            };
             write_access_token(access_token_file, &request.body)?;
             write_response(&mut stream, 200, "FYERS access token updated\n")
         }
+        ("POST", DBINTERNATIONAL_LOGIN_PATH) => {
+            let Some(config) = dbinternational_config(state) else {
+                return write_response(&mut stream, 404, "DBInternational config disabled\n");
+            };
+            write_login_result(&mut stream, login_all(config))
+        }
+        ("POST", DBINTERNATIONAL_MARKET_DATA_LOGIN_PATH) => {
+            let Some(config) = dbinternational_config(state) else {
+                return write_response(&mut stream, 404, "DBInternational config disabled\n");
+            };
+            write_login_result(
+                &mut stream,
+                login_market_data(config).map(|summary| vec![summary]),
+            )
+        }
+        ("POST", DBINTERNATIONAL_INTERACTIVE_LOGIN_PATH) => {
+            let Some(config) = dbinternational_config(state) else {
+                return write_response(&mut stream, 404, "DBInternational config disabled\n");
+            };
+            write_login_result(
+                &mut stream,
+                login_interactive(config).map(|summary| vec![summary]),
+            )
+        }
         ("POST", STRATEGY_RELOAD_PATH) => {
-            let Some(strategy_runtime) = strategy_runtime else {
+            let Some(strategy_runtime) = state.strategy_runtime.as_ref() else {
                 return write_response(&mut stream, 404, "strategy runtime disabled\n");
             };
             let count = strategy_runtime.reload_ssus()?;
@@ -90,6 +127,40 @@ fn handle_connection(
         }
         _ => write_response(&mut stream, 404, "not found\n"),
     }
+}
+
+fn dbinternational_config(state: &AdminState) -> Option<&DbinternationalBrokerSection> {
+    state.dbinternational.as_ref()
+}
+
+fn write_login_result(
+    stream: &mut TcpStream,
+    result: Result<Vec<DbinternationalLoginSummary>, FeedError>,
+) -> Result<(), FeedError> {
+    match result {
+        Ok(summaries) => write_response(stream, 200, &format_login_summaries(&summaries)),
+        Err(error) => write_response(stream, 500, &format!("login failed: {error}\n")),
+    }
+}
+
+fn format_login_summaries(summaries: &[DbinternationalLoginSummary]) -> String {
+    if summaries.is_empty() {
+        return "no logins executed\n".to_string();
+    }
+
+    let mut lines = Vec::with_capacity(summaries.len() + 1);
+    lines.push("DBInternational login completed".to_string());
+    for summary in summaries {
+        lines.push(format!(
+            "{} user_id={} token_file={} session_file={}",
+            summary.kind.as_str(),
+            summary.user_id.as_deref().unwrap_or("-"),
+            summary.token_file,
+            summary.session_file.as_deref().unwrap_or("-")
+        ));
+    }
+    lines.push(String::new());
+    lines.join("\n")
 }
 
 struct HttpRequest {
@@ -191,6 +262,7 @@ fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> Result<(),
     let reason = match status {
         200 => "OK",
         404 => "Not Found",
+        500 => "Internal Server Error",
         _ => "Error",
     };
     let response = format!(
@@ -215,5 +287,19 @@ mod tests {
         assert_eq!(parsed.method, "POST");
         assert_eq!(parsed.path, FYERS_ACCESS_TOKEN_PATH);
         assert_eq!(parsed.body, "token-value");
+    }
+
+    #[test]
+    fn formats_dbinternational_login_summary_without_token_value() {
+        let body = format_login_summaries(&[DbinternationalLoginSummary {
+            kind: crate::adapters::dbinternational::auth::DbinternationalLoginKind::MarketData,
+            user_id: Some("ABC".to_string()),
+            token_file: "runtime/secrets/token".to_string(),
+            session_file: None,
+        }]);
+
+        assert!(body.contains("market_data user_id=ABC"));
+        assert!(body.contains("token_file=runtime/secrets/token"));
+        assert!(!body.contains("token-value"));
     }
 }

@@ -3,6 +3,7 @@ pub mod admin;
 pub mod backtest;
 pub mod config;
 pub mod feeder;
+pub mod login_scheduler;
 pub mod master_scheduler;
 pub mod notification;
 pub mod storage;

@@ -1,0 +1,15 @@
+base_instruments_csv = "config/instruments/delta/base_instruments.csv"
+derivatives_csv = "data/instruments/delta/derivatives.csv"
+master_csv = "data/instruments/delta/master/products.csv"
+ticker_channel = "ticker"
+latest_prices_file = "runtime/delta_latest_prices.txt"
+latest_prices_underlying = "BTC"
+console_logging = false
+instrument_types = ["PERP_FUT", "FUT", "CALL", "PUT"]
+strike_distance_pct = 5.0
+refresh_trigger_pct = 4.5
+rest_url_env = "DELTA_REST_URL"
+ws_public_url_env = "DELTA_WS_PUBLIC_URL"
+ws_private_url_env = "DELTA_WS_PRIVATE_URL"
+api_key_env = "DELTA_API_KEY"
+api_secret_env = "DELTA_API_SECRET"

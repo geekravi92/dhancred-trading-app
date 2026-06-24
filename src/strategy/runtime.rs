@@ -1161,13 +1161,23 @@ pub fn start_strategy_runtime(
 fn load_spot_instruments(config: &AppConfig) -> Result<Vec<String>, StrategyError> {
     let mut instruments = BTreeSet::new();
 
-    if let Some(delta) = config.brokers.delta.as_ref().filter(|delta| delta.enabled) {
+    if config.feed_broker_enabled("DELTA") {
+        let Some(delta) = config.brokers.delta.as_ref() else {
+            return Err(StrategyError::Config(
+                "missing brokers.delta config".to_string(),
+            ));
+        };
         let catalog = InstrumentCatalog::load_csv(&delta.base_instruments_csv)
             .map_err(|error| StrategyError::Config(error.to_string()))?;
         collect_spot_instruments(&catalog, &mut instruments);
     }
 
-    if let Some(fyers) = config.brokers.fyers.as_ref().filter(|fyers| fyers.enabled) {
+    if config.feed_broker_enabled("FYERS") {
+        let Some(fyers) = config.brokers.fyers.as_ref() else {
+            return Err(StrategyError::Config(
+                "missing brokers.fyers config".to_string(),
+            ));
+        };
         let catalog = InstrumentCatalog::load_csv(&fyers.base_instruments_csv)
             .map_err(|error| StrategyError::Config(error.to_string()))?;
         collect_spot_instruments(&catalog, &mut instruments);
@@ -1179,13 +1189,23 @@ fn load_spot_instruments(config: &AppConfig) -> Result<Vec<String>, StrategyErro
 fn load_candle_alignments(config: &AppConfig) -> Result<CandleAlignmentMap, StrategyError> {
     let mut alignments = CandleAlignmentMap::new();
 
-    if let Some(delta) = config.brokers.delta.as_ref().filter(|delta| delta.enabled) {
+    if config.feed_broker_enabled("DELTA") {
+        let Some(delta) = config.brokers.delta.as_ref() else {
+            return Err(StrategyError::Config(
+                "missing brokers.delta config".to_string(),
+            ));
+        };
         let catalog = InstrumentCatalog::load_csv(&delta.base_instruments_csv)
             .map_err(|error| StrategyError::Config(error.to_string()))?;
         merge_candle_alignments(&mut alignments, candle_alignments_from_catalog(&catalog));
     }
 
-    if let Some(fyers) = config.brokers.fyers.as_ref().filter(|fyers| fyers.enabled) {
+    if config.feed_broker_enabled("FYERS") {
+        let Some(fyers) = config.brokers.fyers.as_ref() else {
+            return Err(StrategyError::Config(
+                "missing brokers.fyers config".to_string(),
+            ));
+        };
         let catalog = InstrumentCatalog::load_csv(&fyers.base_instruments_csv)
             .map_err(|error| StrategyError::Config(error.to_string()))?;
         merge_candle_alignments(&mut alignments, candle_alignments_from_catalog(&catalog));

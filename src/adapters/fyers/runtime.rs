@@ -26,10 +26,6 @@ pub fn run_live(
     strategy_runtime: Option<Arc<StrategyRuntimeHandle>>,
     max_events: usize,
 ) -> Result<(), FeedError> {
-    if !config.enabled {
-        return Ok(());
-    }
-
     let log_to_console = config.console_logging.unwrap_or(true);
     let summaries = refresh_all(config)?;
     if log_to_console {

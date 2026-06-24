@@ -62,9 +62,7 @@ impl MarketSessionPolicy {
     fn from_configs(configs: &[FyersMarketSessionSection]) -> Result<Vec<Self>, FeedError> {
         let mut policies = Vec::new();
         for config in configs {
-            if config.enabled {
-                policies.push(Self::from_config(config)?);
-            }
+            policies.push(Self::from_config(config)?);
         }
         Ok(policies)
     }
@@ -253,7 +251,6 @@ mod tests {
 
     fn policy() -> MarketSessionPolicy {
         MarketSessionPolicy::from_config(&FyersMarketSessionSection {
-            enabled: true,
             name: "NSE_BSE_EQUITY".to_string(),
             timezone: "Asia/Kolkata".to_string(),
             open_ist: "09:15".to_string(),
@@ -343,7 +340,6 @@ mod tests {
     fn combined_sessions_allow_connection_until_latest_open_session_close() {
         let equity = policy();
         let commodity = MarketSessionPolicy::from_config(&FyersMarketSessionSection {
-            enabled: true,
             name: "MCX_NON_AGRI".to_string(),
             timezone: "Asia/Kolkata".to_string(),
             open_ist: "09:00".to_string(),
@@ -369,7 +365,6 @@ mod tests {
     fn combined_sessions_sleep_until_earliest_next_window() {
         let equity = policy();
         let commodity = MarketSessionPolicy::from_config(&FyersMarketSessionSection {
-            enabled: true,
             name: "MCX_NON_AGRI".to_string(),
             timezone: "Asia/Kolkata".to_string(),
             open_ist: "09:00".to_string(),

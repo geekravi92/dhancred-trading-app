@@ -1,6 +1,7 @@
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::adapters::dbinternational::master as dbinternational_master;
 use crate::adapters::delta::product_master::{DeltaProductClient, ensure_delta_master_csv};
 use crate::adapters::fyers::master as fyers_master;
 use crate::config::{AppConfig, BrokersSection};
@@ -28,10 +29,7 @@ pub fn start_master_scheduler(
 
     let scheduled_second = parse_ist_hh_mm(&scheduler_config.time_ist)?;
     let weekdays_only = scheduler_config.weekdays_only;
-    let brokers = scheduler_config
-        .brokers
-        .clone()
-        .unwrap_or_else(|| config.feeder.feed_brokers.clone());
+    let brokers = config.feeder.feed_brokers.clone();
     let broker_configs = config.brokers.clone();
 
     println!(
@@ -91,9 +89,6 @@ fn refresh_broker_master(broker_configs: &BrokersSection, broker: &str) -> Resul
             let Some(config) = &broker_configs.delta else {
                 return Ok(());
             };
-            if !config.enabled {
-                return Ok(());
-            }
 
             let client = DeltaProductClient::new(config.rest_url()?);
             ensure_delta_master_csv(&client, &config.master_csv)
@@ -102,9 +97,6 @@ fn refresh_broker_master(broker_configs: &BrokersSection, broker: &str) -> Resul
             let Some(config) = &broker_configs.fyers else {
                 return Ok(());
             };
-            if !config.enabled {
-                return Ok(());
-            }
 
             fyers_master::refresh_all(config).map(|summaries| {
                 for summary in summaries {
@@ -118,6 +110,25 @@ fn refresh_broker_master(broker_configs: &BrokersSection, broker: &str) -> Resul
                         },
                         summary.instrument_count,
                         summary.output_path.display()
+                    );
+                }
+            })
+        }
+        "DBINTERNATIONAL" | "DB" => {
+            let Some(config) = &broker_configs.dbinternational else {
+                return Ok(());
+            };
+
+            dbinternational_master::ensure_master_current(config).map(|summary| {
+                if summary.refreshed {
+                    println!(
+                        "DBInternational master refreshed: {} instruments | {}",
+                        summary.instrument_count, summary.output_path
+                    );
+                } else {
+                    println!(
+                        "DBInternational master skipped: current file has {} instruments | {}",
+                        summary.instrument_count, summary.output_path
                     );
                 }
             })

@@ -1,3 +1,4 @@
+pub mod dbinternational;
 pub mod delta;
 pub mod fyers;
 pub mod historical;
@@ -30,18 +31,16 @@ pub fn run_feed_brokers(
                         FeedError::Config("missing brokers.delta config".to_string())
                     })?;
 
-                if delta_config.enabled {
-                    let historical_candles = config.historical_candles.clone();
-                    let strategy_runtime = strategy_runtime.clone();
-                    spawn_broker(&mut handles, "DELTA", move || {
-                        delta::runtime::run_live(
-                            &delta_config,
-                            historical_candles.as_ref(),
-                            strategy_runtime.clone(),
-                            max_events,
-                        )
-                    });
-                }
+                let historical_candles = config.historical_candles.clone();
+                let strategy_runtime = strategy_runtime.clone();
+                spawn_broker(&mut handles, "DELTA", move || {
+                    delta::runtime::run_live(
+                        &delta_config,
+                        historical_candles.as_ref(),
+                        strategy_runtime.clone(),
+                        max_events,
+                    )
+                });
             }
             "FYERS" => {
                 let fyers_config =
@@ -49,18 +48,33 @@ pub fn run_feed_brokers(
                         FeedError::Config("missing brokers.fyers config".to_string())
                     })?;
 
-                if fyers_config.enabled {
-                    let historical_candles = config.historical_candles.clone();
-                    let strategy_runtime = strategy_runtime.clone();
-                    spawn_broker(&mut handles, "FYERS", move || {
-                        fyers::run_live(
-                            &fyers_config,
-                            historical_candles.as_ref(),
-                            strategy_runtime.clone(),
-                            max_events,
-                        )
-                    });
-                }
+                let historical_candles = config.historical_candles.clone();
+                let strategy_runtime = strategy_runtime.clone();
+                spawn_broker(&mut handles, "FYERS", move || {
+                    fyers::run_live(
+                        &fyers_config,
+                        historical_candles.as_ref(),
+                        strategy_runtime.clone(),
+                        max_events,
+                    )
+                });
+            }
+            "DBINTERNATIONAL" | "DB" => {
+                let dbinternational_config =
+                    config.brokers.dbinternational.clone().ok_or_else(|| {
+                        FeedError::Config("missing brokers.dbinternational config".to_string())
+                    })?;
+
+                let historical_candles = config.historical_candles.clone();
+                let strategy_runtime = strategy_runtime.clone();
+                spawn_broker(&mut handles, "DBINTERNATIONAL", move || {
+                    dbinternational::runtime::run_live(
+                        &dbinternational_config,
+                        historical_candles.as_ref(),
+                        strategy_runtime.clone(),
+                        max_events,
+                    )
+                });
             }
             value => {
                 return Err(FeedError::Config(format!(
