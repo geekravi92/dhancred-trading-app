@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::ErrorKind;
 use std::io::Read;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, RwLock};
@@ -14,7 +15,9 @@ use socketio_client::manager::ManagerOptions;
 
 use crate::adapters::dbinternational::auth::read_market_data_session;
 use crate::config::DbinternationalBrokerSection;
-use crate::feeder::{FeedError, InstrumentName, Price, PriceEvent, PriceTick, UnixMillis};
+use crate::feeder::{
+    FeedError, InstrumentDefinition, InstrumentName, Price, PriceEvent, PriceTick, UnixMillis,
+};
 
 const TOUCHLINE_MESSAGE_CODE: u16 = 1501;
 
@@ -36,13 +39,27 @@ struct DbinternationalMasterCatalog {
 }
 
 impl DbinternationalMasterCatalog {
-    fn load(path: &str) -> Result<Self, FeedError> {
-        let content = fs::read_to_string(path).map_err(|error| {
+    fn load(config: &DbinternationalBrokerSection) -> Result<Self, FeedError> {
+        let content = fs::read_to_string(&config.market_data_master_file).map_err(|error| {
             FeedError::Config(format!(
-                "failed to read DBInternational master {path}: {error}"
+                "failed to read DBInternational master {}: {error}",
+                config.market_data_master_file
             ))
         })?;
-        parse_master_catalog(&content)
+        let mut catalog = parse_master_catalog(&content)?;
+
+        match fs::read_to_string(&config.market_data_index_file) {
+            Ok(index_content) => catalog.merge(parse_master_catalog(&index_content)?),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(FeedError::Config(format!(
+                    "failed to read DBInternational index master {}: {error}",
+                    config.market_data_index_file
+                )));
+            }
+        }
+
+        Ok(catalog)
     }
 
     fn resolve_symbol(&self, symbol: &str) -> Result<DbinternationalMasterInstrument, FeedError> {
@@ -73,6 +90,15 @@ impl DbinternationalMasterCatalog {
         }
 
         Ok(matches[0].clone())
+    }
+
+    fn merge(&mut self, other: DbinternationalMasterCatalog) {
+        for (alias, mut instruments) in other.by_alias {
+            self.by_alias
+                .entry(alias)
+                .or_default()
+                .append(&mut instruments);
+        }
     }
 }
 
@@ -105,7 +131,7 @@ impl DbinternationalLiveFeeder {
                     .to_string(),
             )
         })?;
-        let catalog = DbinternationalMasterCatalog::load(&config.market_data_master_file)?;
+        let catalog = DbinternationalMasterCatalog::load(config)?;
         let socket_url = market_data_socket_url(
             &session.base_url,
             &session.access_token,
@@ -145,21 +171,23 @@ impl DbinternationalLiveFeeder {
     pub fn subscribe_symbols(&self, symbols: &[String]) -> Result<(), FeedError> {
         if symbols.is_empty() {
             return Err(FeedError::Config(
-                "DBInternational market_data_subscribe_symbols cannot be empty".to_string(),
+                "DBInternational subscription symbols cannot be empty".to_string(),
             ));
         }
 
-        let mut subscriptions = Vec::new();
-        for symbol in symbols {
-            let instrument = self.catalog.resolve_symbol(symbol)?;
+        let resolved = self.resolve_subscription_symbols(symbols)?;
+        let subscriptions = resolved
+            .iter()
+            .map(|(_, instrument)| SubscriptionInstrument {
+                exchange_segment: instrument.key.exchange_segment,
+                exchange_instrument_id: instrument.key.exchange_instrument_id,
+            })
+            .collect::<Vec<_>>();
+        for (symbol, instrument) in &resolved {
             self.instrument_names
                 .write()
                 .expect("DBInternational instrument map lock poisoned")
                 .insert(instrument.key, InstrumentName::new(symbol.trim()));
-            subscriptions.push(SubscriptionInstrument {
-                exchange_segment: instrument.key.exchange_segment,
-                exchange_instrument_id: instrument.key.exchange_instrument_id,
-            });
         }
 
         for chunk in subscriptions.chunks(100) {
@@ -174,6 +202,55 @@ impl DbinternationalLiveFeeder {
         Ok(())
     }
 
+    pub fn unsubscribe_symbols(&self, symbols: &[String]) -> Result<(), FeedError> {
+        if symbols.is_empty() {
+            return Ok(());
+        }
+
+        let resolved = self.resolve_subscription_symbols(symbols)?;
+        let subscriptions = resolved
+            .iter()
+            .map(|(_, instrument)| SubscriptionInstrument {
+                exchange_segment: instrument.key.exchange_segment,
+                exchange_instrument_id: instrument.key.exchange_instrument_id,
+            })
+            .collect::<Vec<_>>();
+
+        for chunk in subscriptions.chunks(100) {
+            self.unsubscribe_chunk(chunk)?;
+        }
+        for (_, instrument) in resolved {
+            self.instrument_names
+                .write()
+                .expect("DBInternational instrument map lock poisoned")
+                .remove(&instrument.key);
+        }
+
+        Ok(())
+    }
+
+    pub fn subscribe_instruments(
+        &self,
+        instruments: &[InstrumentDefinition],
+    ) -> Result<(), FeedError> {
+        if instruments.is_empty() {
+            return Ok(());
+        }
+        let resolved = resolve_subscription_instruments(instruments)?;
+        self.subscribe_resolved(resolved)
+    }
+
+    pub fn unsubscribe_instruments(
+        &self,
+        instruments: &[InstrumentDefinition],
+    ) -> Result<(), FeedError> {
+        if instruments.is_empty() {
+            return Ok(());
+        }
+        let resolved = resolve_subscription_instruments(instruments)?;
+        self.unsubscribe_resolved(resolved)
+    }
+
     pub fn next_price_event(&self) -> Result<Option<PriceEvent>, FeedError> {
         match self.receiver.recv() {
             Ok(DbinternationalLiveMessage::Event(event)) => Ok(Some(event)),
@@ -182,6 +259,75 @@ impl DbinternationalLiveFeeder {
                 "DBInternational event channel closed: {error}"
             ))),
         }
+    }
+
+    fn resolve_subscription_symbols(
+        &self,
+        symbols: &[String],
+    ) -> Result<Vec<(String, DbinternationalMasterInstrument)>, FeedError> {
+        symbols
+            .iter()
+            .map(|symbol| {
+                self.catalog
+                    .resolve_symbol(symbol)
+                    .map(|instrument| (symbol.trim().to_string(), instrument))
+            })
+            .collect()
+    }
+
+    fn subscribe_resolved(
+        &self,
+        resolved: Vec<(String, DbinternationalMasterInstrument)>,
+    ) -> Result<(), FeedError> {
+        let subscriptions = resolved
+            .iter()
+            .map(|(_, instrument)| SubscriptionInstrument {
+                exchange_segment: instrument.key.exchange_segment,
+                exchange_instrument_id: instrument.key.exchange_instrument_id,
+            })
+            .collect::<Vec<_>>();
+        for (symbol, instrument) in &resolved {
+            self.instrument_names
+                .write()
+                .expect("DBInternational instrument map lock poisoned")
+                .insert(instrument.key, InstrumentName::new(symbol.trim()));
+        }
+
+        for chunk in subscriptions.chunks(100) {
+            let response_json = self.subscribe_chunk(chunk)?;
+            queue_subscription_response_ticks(
+                &response_json,
+                &self.instrument_names,
+                &self.sender,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn unsubscribe_resolved(
+        &self,
+        resolved: Vec<(String, DbinternationalMasterInstrument)>,
+    ) -> Result<(), FeedError> {
+        let subscriptions = resolved
+            .iter()
+            .map(|(_, instrument)| SubscriptionInstrument {
+                exchange_segment: instrument.key.exchange_segment,
+                exchange_instrument_id: instrument.key.exchange_instrument_id,
+            })
+            .collect::<Vec<_>>();
+
+        for chunk in subscriptions.chunks(100) {
+            self.unsubscribe_chunk(chunk)?;
+        }
+        for (_, instrument) in resolved {
+            self.instrument_names
+                .write()
+                .expect("DBInternational instrument map lock poisoned")
+                .remove(&instrument.key);
+        }
+
+        Ok(())
     }
 
     fn subscribe_chunk(&self, instruments: &[SubscriptionInstrument]) -> Result<Value, FeedError> {
@@ -226,6 +372,89 @@ impl DbinternationalLiveFeeder {
 
         Ok(response_json)
     }
+
+    fn unsubscribe_chunk(&self, instruments: &[SubscriptionInstrument]) -> Result<(), FeedError> {
+        let request = SubscriptionRequest {
+            instruments,
+            xts_message_code: TOUCHLINE_MESSAGE_CODE,
+        };
+        let response = self
+            .http
+            .put(&self.subscription_url)
+            .header(ACCEPT, "application/json")
+            .header(CONTENT_TYPE, "application/json")
+            .header(USER_AGENT, "dhancred-trading-app/0.1")
+            .header(AUTHORIZATION, &self.access_token)
+            .json(&request)
+            .send()?;
+        let status = response.status();
+        let body = response.text()?;
+        let response_json: Value = serde_json::from_str(&body)?;
+
+        if !status.is_success() {
+            return Err(FeedError::Http(format!(
+                "DBInternational unsubscription failed url={} status={} body={}",
+                self.subscription_url,
+                status.as_u16(),
+                response_snippet(&body)
+            )));
+        }
+
+        let envelope = response_envelope(&response_json).ok_or_else(|| {
+            FeedError::Parse(
+                "DBInternational unsubscription response envelope is empty".to_string(),
+            )
+        })?;
+        if envelope.get("type").and_then(Value::as_str) != Some("success") {
+            return Err(FeedError::Http(format!(
+                "DBInternational unsubscription returned non-success response: {}",
+                response_snippet(&envelope.to_string())
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+fn resolve_subscription_instruments(
+    instruments: &[InstrumentDefinition],
+) -> Result<Vec<(String, DbinternationalMasterInstrument)>, FeedError> {
+    instruments
+        .iter()
+        .map(|instrument| {
+            let key = instrument_key_from_token(&instrument.instrument_token)?;
+            Ok((
+                instrument.trading_symbol.clone(),
+                DbinternationalMasterInstrument {
+                    key,
+                    aliases: vec![instrument.trading_symbol.clone()],
+                },
+            ))
+        })
+        .collect()
+}
+
+fn instrument_key_from_token(value: &str) -> Result<DbinternationalInstrumentKey, FeedError> {
+    let Some((exchange_segment, exchange_instrument_id)) = value.trim().split_once(':') else {
+        return Err(FeedError::InvalidInstrument(format!(
+            "DBInternational instrument_token {value} must be exchangeSegment:exchangeInstrumentID"
+        )));
+    };
+    let exchange_segment_code = exchange_segment_code(exchange_segment).ok_or_else(|| {
+        FeedError::InvalidInstrument(format!(
+            "unsupported DBInternational exchange segment {exchange_segment}"
+        ))
+    })?;
+    let exchange_instrument_id = exchange_instrument_id.parse::<u64>().map_err(|error| {
+        FeedError::InvalidInstrument(format!(
+            "invalid DBInternational exchangeInstrumentID {exchange_instrument_id}: {error}"
+        ))
+    })?;
+
+    Ok(DbinternationalInstrumentKey {
+        exchange_segment: exchange_segment_code,
+        exchange_instrument_id,
+    })
 }
 
 fn subscription_already_exists(response_json: &Value) -> bool {
@@ -920,7 +1149,13 @@ fn parse_master_line(line: &str) -> Result<Option<DbinternationalMasterInstrumen
 
 fn alias_fields(fields: &[&str]) -> Vec<String> {
     let mut aliases = Vec::new();
+    let is_derivative = fields
+        .get(2)
+        .is_some_and(|instrument_type| matches!(*instrument_type, "1" | "2" | "4"));
     for index in [3usize, 4, 6, 14, 15, 17, 18, 19, 20, 22] {
+        if is_derivative && matches!(index, 3 | 15) {
+            continue;
+        }
         let Some(value) = fields.get(index) else {
             continue;
         };
@@ -1145,7 +1380,33 @@ NSEFO|61093|1|NIFTY|NIFTY26JULFUT|FUTIDX|NIFTY-FUTIDX|2620900061093|26345.4|2155
 ";
         let catalog = parse_master_catalog(content).expect("catalog");
 
-        assert!(catalog.resolve_symbol("NIFTY").is_err());
+        assert!(catalog.resolve_symbol("NIFTY-FUTIDX").is_err());
+    }
+
+    #[test]
+    fn resolves_index_cache_rows_without_derivative_underlying_ambiguity() {
+        let content = "\
+NSEFO|75452|2|BANKNIFTY|BANKNIFTY26JUN52100PE|OPTIDX|BANKNIFTY-OPTIDX|2618100075452|27.25|0.05|901|0.05|30|1|-1|Nifty Bank|2026-06-30T14:30:00|52100|4|BANKNIFTY 30JUN2026 PE 52100|1|1|BANKNIFTY26JUN52100PE
+NSECM|26001|16|NIFTY BANK|NIFTY BANK|INDEX|NIFTY BANK-INDEX|26001|0|0|0|0.05|1|1|NIFTY BANK|NIFTYBANK|1|1||||-1|NIFTY BANK
+BSECM|26065|16|SENSEX|SENSEX|INDEX|SENSEX-INDEX|26065|0|0|0|0.05|1|1|SENSEX|SENSEX|1|1||||-1|SENSEX
+";
+        let catalog = parse_master_catalog(content).expect("catalog");
+
+        let bank_nifty = catalog.resolve_symbol("NIFTY BANK").expect("bank nifty");
+        assert_eq!(bank_nifty.key.exchange_segment, 1);
+        assert_eq!(bank_nifty.key.exchange_instrument_id, 26001);
+
+        let sensex = catalog.resolve_symbol("SENSEX").expect("sensex");
+        assert_eq!(sensex.key.exchange_segment, 11);
+        assert_eq!(sensex.key.exchange_instrument_id, 26065);
+    }
+
+    #[test]
+    fn parses_exact_subscription_key_from_universe_token() {
+        let key = instrument_key_from_token("NSEFO:65238").expect("key");
+
+        assert_eq!(key.exchange_segment, 2);
+        assert_eq!(key.exchange_instrument_id, 65238);
     }
 
     #[test]

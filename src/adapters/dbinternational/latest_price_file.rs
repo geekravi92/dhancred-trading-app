@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -11,27 +12,43 @@ pub struct DbinternationalLatestPriceFile {
 
 impl DbinternationalLatestPriceFile {
     pub fn new(path: impl Into<PathBuf>, symbols: &[String]) -> Result<Self, FeedError> {
-        let mut instruments = Vec::new();
-        for symbol in symbols {
-            if instruments
-                .iter()
-                .any(|instrument: &TrackedInstrumentPrice| instrument.symbol == *symbol)
-            {
-                continue;
-            }
-            instruments.push(TrackedInstrumentPrice {
-                symbol: symbol.clone(),
-                price: None,
-            });
-        }
-
-        let file = Self {
+        let mut file = Self {
             path: path.into(),
-            instruments,
+            instruments: Vec::new(),
         };
-        file.write()?;
+        file.set_symbols(symbols)?;
 
         Ok(file)
+    }
+
+    pub fn set_symbols(&mut self, symbols: &[String]) -> Result<(), FeedError> {
+        let existing_prices = self
+            .instruments
+            .iter()
+            .map(|instrument| (instrument.symbol.clone(), instrument.price))
+            .collect::<BTreeMap<_, _>>();
+        let mut symbols = symbols
+            .iter()
+            .map(|symbol| symbol.trim())
+            .filter(|symbol| !symbol.is_empty())
+            .collect::<Vec<_>>();
+        symbols.sort();
+        symbols.dedup();
+
+        let next_instruments = symbols
+            .into_iter()
+            .map(|symbol| TrackedInstrumentPrice {
+                symbol: symbol.to_string(),
+                price: existing_prices.get(symbol).copied().flatten(),
+            })
+            .collect::<Vec<_>>();
+
+        if self.instruments != next_instruments {
+            self.instruments = next_instruments;
+            self.write()?;
+        }
+
+        Ok(())
     }
 
     pub fn update_tick(
@@ -74,7 +91,7 @@ impl DbinternationalLatestPriceFile {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct TrackedInstrumentPrice {
     symbol: String,
     price: Option<f64>,
@@ -158,6 +175,27 @@ mod tests {
         assert_eq!(
             fs::read_to_string(path).expect("latest prices"),
             "GOLD05AUG2026FUT: -\n"
+        );
+    }
+
+    #[test]
+    fn replaces_symbols_and_preserves_existing_prices() {
+        let path = test_path("replace-symbols");
+        let symbols = vec!["GOLD".to_string(), "GOLD26JUNFUT".to_string()];
+        let mut file = DbinternationalLatestPriceFile::new(&path, &symbols).expect("file");
+
+        file.update_tick(&InstrumentName::new("GOLD"), 90_000.0)
+            .expect("gold tick");
+        file.set_symbols(&[
+            "GOLD".to_string(),
+            "SENSEX".to_string(),
+            "SENSEX26JUNFUT".to_string(),
+        ])
+        .expect("set symbols");
+
+        assert_eq!(
+            fs::read_to_string(path).expect("latest prices"),
+            "GOLD: 90000.0000\nSENSEX: -\nSENSEX26JUNFUT: -\n"
         );
     }
 

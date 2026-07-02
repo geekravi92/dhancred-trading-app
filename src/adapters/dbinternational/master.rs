@@ -20,12 +20,15 @@ const DAY_SECONDS: u64 = 86_400;
 pub struct DbinternationalMasterRefreshSummary {
     pub instrument_count: usize,
     pub output_path: String,
+    pub index_count: usize,
+    pub index_output_path: String,
     pub refreshed: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct DbinternationalMasterClient {
     master_url: String,
+    index_list_url: String,
     access_token: String,
     client: Client,
 }
@@ -42,9 +45,11 @@ impl DbinternationalMasterClient {
 
         let session = read_market_data_session(config)?;
         let master_url = market_data_master_url_from_base_url(&session.base_url)?;
+        let index_list_url = market_data_index_list_url_from_base_url(&session.base_url)?;
 
         Ok(Self {
             master_url,
+            index_list_url,
             access_token: session.access_token,
             client: Client::builder()
                 .default_headers(headers)
@@ -86,6 +91,39 @@ impl DbinternationalMasterClient {
         let response_json: Value = serde_json::from_slice(&body)?;
         parse_master_response(&response_json)
     }
+
+    fn fetch_index_list(
+        &self,
+        exchange_segment: &str,
+    ) -> Result<Vec<DbinternationalIndex>, FeedError> {
+        let exchange_segment = exchange_segment.trim();
+        let exchange_segment_code = exchange_segment_code(exchange_segment).ok_or_else(|| {
+            FeedError::Config(format!(
+                "unsupported DBInternational index exchange segment {exchange_segment}"
+            ))
+        })?;
+
+        let response = self
+            .client
+            .get(&self.index_list_url)
+            .header(AUTHORIZATION, &self.access_token)
+            .query(&[("exchangeSegment", exchange_segment_code.to_string())])
+            .send()?;
+        let status = response.status();
+        let body = response.bytes()?;
+
+        if !status.is_success() {
+            return Err(FeedError::Http(format!(
+                "DBInternational indexlist failed segment={} status={} body={}",
+                exchange_segment,
+                status.as_u16(),
+                response_snippet(&String::from_utf8_lossy(&body))
+            )));
+        }
+
+        let response_json: Value = serde_json::from_slice(&body)?;
+        parse_index_list_response(exchange_segment, &response_json)
+    }
 }
 
 #[derive(Serialize)]
@@ -94,30 +132,77 @@ struct MasterRequest<'a> {
     exchange_segment_list: &'a [String],
 }
 
-pub fn refresh_master(config: &DbinternationalBrokerSection) -> Result<usize, FeedError> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DbinternationalIndex {
+    exchange_segment: String,
+    exchange_instrument_id: u64,
+    name: String,
+}
+
+pub fn refresh_master(
+    config: &DbinternationalBrokerSection,
+) -> Result<DbinternationalMasterRefreshSummary, FeedError> {
     let client = DbinternationalMasterClient::new(config)?;
     let content = client.fetch_master(&config.market_data_exchange_segments)?;
-    write_master_file(&config.market_data_master_file, &content)
+    let instrument_count = write_master_file(&config.market_data_master_file, &content)?;
+    let index_content =
+        client.fetch_index_master_content(&config.market_data_index_exchange_segments)?;
+    let index_count = write_master_file(&config.market_data_index_file, &index_content)?;
+
+    Ok(DbinternationalMasterRefreshSummary {
+        instrument_count,
+        output_path: config.market_data_master_file.clone(),
+        index_count,
+        index_output_path: config.market_data_index_file.clone(),
+        refreshed: true,
+    })
 }
 
 pub fn ensure_master_current(
     config: &DbinternationalBrokerSection,
 ) -> Result<DbinternationalMasterRefreshSummary, FeedError> {
     let now = now_epoch_secs();
-    if master_file_current_today(&config.market_data_master_file, now)? {
+    if master_file_current_today(&config.market_data_master_file, now)?
+        && master_file_current_today(&config.market_data_index_file, now)?
+    {
         return Ok(DbinternationalMasterRefreshSummary {
             instrument_count: count_master_file_lines(&config.market_data_master_file)?,
             output_path: config.market_data_master_file.clone(),
+            index_count: count_master_file_lines(&config.market_data_index_file)?,
+            index_output_path: config.market_data_index_file.clone(),
             refreshed: false,
         });
     }
 
-    let instrument_count = refresh_master(config)?;
-    Ok(DbinternationalMasterRefreshSummary {
-        instrument_count,
-        output_path: config.market_data_master_file.clone(),
-        refreshed: true,
-    })
+    refresh_master(config)
+}
+
+impl DbinternationalMasterClient {
+    fn fetch_index_master_content(
+        &self,
+        exchange_segments: &[String],
+    ) -> Result<String, FeedError> {
+        if exchange_segments.is_empty() {
+            return Err(FeedError::Config(
+                "DBInternational market_data_index_exchange_segments cannot be empty".to_string(),
+            ));
+        }
+
+        let mut rows = Vec::new();
+        for exchange_segment in exchange_segments {
+            for index in self.fetch_index_list(exchange_segment)? {
+                rows.push(index_master_line(&index));
+            }
+        }
+
+        if rows.is_empty() {
+            return Err(FeedError::Parse(
+                "DBInternational indexlist returned no indices".to_string(),
+            ));
+        }
+
+        Ok(rows.join("\n"))
+    }
 }
 
 fn parse_master_response(response_json: &Value) -> Result<String, FeedError> {
@@ -160,6 +245,131 @@ fn parse_master_response(response_json: &Value) -> Result<String, FeedError> {
     Ok(content)
 }
 
+fn parse_index_list_response(
+    exchange_segment: &str,
+    response_json: &Value,
+) -> Result<Vec<DbinternationalIndex>, FeedError> {
+    let envelope = response_envelope(response_json).ok_or_else(|| {
+        FeedError::Parse("DBInternational indexlist response is empty".to_string())
+    })?;
+
+    let response_type = envelope.get("type").and_then(Value::as_str);
+    if response_type != Some("success") {
+        return Err(FeedError::Http(format!(
+            "DBInternational indexlist returned non-success response: {}",
+            response_snippet(&envelope.to_string())
+        )));
+    }
+
+    let result = envelope
+        .get("result")
+        .ok_or_else(|| FeedError::Parse("DBInternational indexlist missing result".to_string()))?;
+    let values = result
+        .get("indexList")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            FeedError::Parse("DBInternational indexlist missing indexList".to_string())
+        })?;
+
+    let mut indices = Vec::new();
+    for value in values {
+        let Some(raw_index) = value.as_str() else {
+            continue;
+        };
+        let Some((name, instrument_id)) = raw_index.trim().rsplit_once('_') else {
+            return Err(FeedError::Parse(format!(
+                "DBInternational index entry has unsupported format: {raw_index}"
+            )));
+        };
+        let exchange_instrument_id = instrument_id.parse::<u64>().map_err(|error| {
+            FeedError::Parse(format!(
+                "invalid DBInternational index exchangeInstrumentID {instrument_id}: {error}"
+            ))
+        })?;
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+
+        indices.push(DbinternationalIndex {
+            exchange_segment: exchange_segment.trim().to_ascii_uppercase(),
+            exchange_instrument_id,
+            name: name.to_string(),
+        });
+    }
+
+    Ok(indices)
+}
+
+fn index_master_line(index: &DbinternationalIndex) -> String {
+    let aliases = index_aliases(&index.name);
+    let alias_1 = aliases.first().map(String::as_str).unwrap_or("");
+    let alias_2 = aliases.get(1).map(String::as_str).unwrap_or("");
+    let alias_3 = aliases.get(2).map(String::as_str).unwrap_or("");
+    let alias_4 = aliases.get(3).map(String::as_str).unwrap_or("");
+
+    format!(
+        "{}|{}|16|{}|{}|INDEX|{}-INDEX|{}|0|0|0|0.05|1|1|{}|{}|1|1|{}|{}|{}|-1|{}",
+        index.exchange_segment,
+        index.exchange_instrument_id,
+        index.name,
+        index.name,
+        index.name,
+        index.exchange_instrument_id,
+        index.name,
+        alias_1,
+        alias_2,
+        alias_3,
+        alias_4,
+        index.name
+    )
+}
+
+fn index_aliases(name: &str) -> Vec<String> {
+    let mut aliases = Vec::new();
+    push_unique_alias(&mut aliases, &compact_alias(name));
+
+    match name.trim().to_ascii_uppercase().as_str() {
+        "NIFTY 50" => {
+            push_unique_alias(&mut aliases, "NIFTY50");
+        }
+        "NIFTY BANK" => {
+            push_unique_alias(&mut aliases, "NIFTYBANK");
+        }
+        "NIFTY MID SELECT" => {
+            push_unique_alias(&mut aliases, "NIFTYMIDSELECT");
+            push_unique_alias(&mut aliases, "MIDCPNIFTY");
+            push_unique_alias(&mut aliases, "MIDCAPSELECT");
+        }
+        "SENSEX" => {
+            push_unique_alias(&mut aliases, "SENSEX");
+        }
+        _ => {}
+    }
+
+    aliases
+}
+
+fn compact_alias(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+}
+
+fn push_unique_alias(aliases: &mut Vec<String>, value: &str) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    if aliases
+        .iter()
+        .all(|existing| !existing.eq_ignore_ascii_case(value))
+    {
+        aliases.push(value.to_string());
+    }
+}
+
 fn response_envelope(response_json: &Value) -> Option<&Value> {
     response_json
         .as_array()
@@ -183,15 +393,44 @@ fn market_data_master_url_from_base_url(base_url: &str) -> Result<String, FeedEr
     Ok(format!("{base_url}/instruments/master"))
 }
 
+fn market_data_index_list_url_from_base_url(base_url: &str) -> Result<String, FeedError> {
+    let base_url = normalize_market_data_base_url(base_url);
+    if base_url.is_empty() {
+        return Err(FeedError::Config(
+            "DBInternational market-data session base_url is empty".to_string(),
+        ));
+    }
+    Ok(format!("{base_url}/instruments/indexlist"))
+}
+
 fn normalize_market_data_base_url(value: &str) -> String {
     let mut value = value.trim().trim_end_matches('/').to_string();
-    for suffix in ["/instruments/master", "/auth/login"] {
+    for suffix in [
+        "/instruments/indexlist",
+        "/instruments/master",
+        "/auth/login",
+    ] {
         let lower = value.to_ascii_lowercase();
         if lower.ends_with(suffix) {
             value.truncate(value.len() - suffix.len());
         }
     }
     value
+}
+
+fn exchange_segment_code(value: &str) -> Option<u16> {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "NSECM" => Some(1),
+        "NSEFO" => Some(2),
+        "NSECD" => Some(3),
+        "NSECO" => Some(4),
+        "BSECM" => Some(11),
+        "BSEFO" => Some(12),
+        "BSECD" => Some(13),
+        "NCDEX" => Some(21),
+        "MCXFO" => Some(51),
+        _ => None,
+    }
 }
 
 fn write_master_file(path: impl AsRef<Path>, content: &str) -> Result<usize, FeedError> {
@@ -327,6 +566,56 @@ mod tests {
             url,
             "https://developers.symphonyfintech.in/apibinarymarketdata/instruments/master"
         );
+    }
+
+    #[test]
+    fn builds_indexlist_url_from_saved_session_base_url() {
+        let url = market_data_index_list_url_from_base_url(
+            "https://developers.symphonyfintech.in/apibinarymarketdata/instruments/indexlist",
+        )
+        .expect("indexlist url");
+
+        assert_eq!(
+            url,
+            "https://developers.symphonyfintech.in/apibinarymarketdata/instruments/indexlist"
+        );
+    }
+
+    #[test]
+    fn parses_indexlist_response() {
+        let value = serde_json::json!({
+            "type": "success",
+            "result": {
+                "exchangeSegment": "1",
+                "indexList": [
+                    "NIFTY 50_26000",
+                    "NIFTY BANK_26001",
+                    "NIFTY MID SELECT_26121"
+                ]
+            }
+        });
+
+        let indices = parse_index_list_response("NSECM", &value).expect("indexlist");
+
+        assert_eq!(indices.len(), 3);
+        assert_eq!(indices[0].name, "NIFTY 50");
+        assert_eq!(indices[0].exchange_instrument_id, 26000);
+        assert_eq!(indices[2].exchange_segment, "NSECM");
+    }
+
+    #[test]
+    fn formats_index_master_line_with_aliases() {
+        let index = DbinternationalIndex {
+            exchange_segment: "BSECM".to_string(),
+            exchange_instrument_id: 26065,
+            name: "SENSEX".to_string(),
+        };
+
+        let line = index_master_line(&index);
+
+        assert!(line.starts_with("BSECM|26065|16|SENSEX|"));
+        assert!(line.contains("|INDEX|"));
+        assert_eq!(line.split('|').count(), 23);
     }
 
     #[test]
