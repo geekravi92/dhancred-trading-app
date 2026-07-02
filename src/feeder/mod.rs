@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod error;
 pub mod event;
 pub mod historical_candles;
+pub mod market_session;
 pub mod universe;
 
 pub use candle_alignment::{
@@ -14,6 +15,10 @@ pub use catalog::{
 };
 pub use error::FeedError;
 pub use event::{Candle, FeedChannel, Price, PriceEvent, PriceTick, Timeframe, UnixMillis};
+pub use market_session::{
+    ExchangeSessionStatus, MarketSessionPolicy, MarketSessionSchedule, exchange_key,
+    wait_for_any_exchange_session,
+};
 pub use universe::{RefreshDecision, SubscriptionDiff, UniverseRefreshState};
 
 pub trait Feeder {

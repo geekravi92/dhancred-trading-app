@@ -76,6 +76,17 @@ impl UniverseRefreshState {
             unsubscribe,
         }
     }
+
+    pub fn reset(&mut self) -> SubscriptionDiff {
+        let unsubscribe = self.active_symbols.iter().cloned().collect();
+        self.anchor_price = None;
+        self.active_symbols.clear();
+
+        SubscriptionDiff {
+            subscribe: Vec::new(),
+            unsubscribe,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -134,5 +145,27 @@ mod tests {
 
         assert_eq!(second.subscribe, vec!["C-BTC-74000-120426".to_string()]);
         assert_eq!(second.unsubscribe, vec!["C-BTC-73000-120426".to_string()]);
+    }
+
+    #[test]
+    fn reset_unsubscribes_active_symbols_and_clears_anchor() {
+        let mut state = UniverseRefreshState::new(4.5);
+        state.on_underlying_price(100.0);
+        state.apply_symbols(BTreeSet::from([
+            "BTCUSD".to_string(),
+            "C-BTC-73000-120426".to_string(),
+        ]));
+
+        let diff = state.reset();
+
+        assert_eq!(diff.subscribe.len(), 0);
+        assert_eq!(
+            diff.unsubscribe,
+            vec!["BTCUSD".to_string(), "C-BTC-73000-120426".to_string()]
+        );
+        assert!(matches!(
+            state.on_underlying_price(101.0),
+            RefreshDecision::Initialized { .. }
+        ));
     }
 }

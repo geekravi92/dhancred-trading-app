@@ -742,12 +742,8 @@ mod tests {
             .timestamp_millis() as u64;
 
         assert_eq!(
-            bucket_bounds(
-                Timeframe::OneHour,
-                inside_hour,
-                CandleAlignment::INDIAN_MARKET
-            )
-            .expect("bucket"),
+            bucket_bounds(Timeframe::OneHour, inside_hour, indian_market_alignment())
+                .expect("bucket"),
             (expected_start, expected_end)
         );
     }
@@ -774,11 +770,18 @@ mod tests {
             bucket_bounds(
                 Timeframe::OneHour,
                 inside_last_hour,
-                CandleAlignment::INDIAN_MARKET
+                indian_market_alignment()
             )
             .expect("bucket"),
             (expected_start, expected_end)
         );
+    }
+
+    fn indian_market_alignment() -> CandleAlignment {
+        CandleAlignment {
+            anchor_offset_seconds: 3 * 60 * 60 + 45 * 60,
+            session_close_offset_seconds: Some(10 * 60 * 60),
+        }
     }
 
     #[test]

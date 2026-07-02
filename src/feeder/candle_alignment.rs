@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::feeder::catalog::{InstrumentCatalog, InstrumentDefinition};
+use crate::feeder::market_session::{MarketSessionPolicy, MarketSessionSchedule};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CandleAlignment {
@@ -16,32 +17,34 @@ impl CandleAlignment {
         session_close_offset_seconds: None,
     };
 
-    pub const INDIAN_MARKET: Self = Self {
-        // 09:15 IST is 03:45 UTC.
-        anchor_offset_seconds: 3 * 60 * 60 + 45 * 60,
-        // 15:30 IST is 10:00 UTC.
-        session_close_offset_seconds: Some(10 * 60 * 60),
-    };
+    pub fn for_instrument(
+        instrument: &InstrumentDefinition,
+        market_sessions: &MarketSessionSchedule,
+    ) -> Self {
+        market_sessions
+            .policy_for_exchange(&instrument.exchange)
+            .map(Self::from_market_session)
+            .unwrap_or(Self::UTC)
+    }
 
-    pub fn for_instrument(instrument: &InstrumentDefinition) -> Self {
-        let exchange = instrument.exchange.trim().to_ascii_uppercase();
-        let broker = instrument.broker.trim().to_ascii_uppercase();
-
-        if broker == "FYERS" || matches!(exchange.as_str(), "NSE" | "BSE" | "NFO" | "BFO" | "MCX") {
-            Self::INDIAN_MARKET
-        } else {
-            Self::UTC
+    fn from_market_session(policy: &MarketSessionPolicy) -> Self {
+        Self {
+            anchor_offset_seconds: policy.candle_anchor_offset_seconds(),
+            session_close_offset_seconds: policy.candle_close_offset_seconds(),
         }
     }
 }
 
-pub fn candle_alignments_from_catalog(catalog: &InstrumentCatalog) -> CandleAlignmentMap {
+pub fn candle_alignments_from_catalog(
+    catalog: &InstrumentCatalog,
+    market_sessions: &MarketSessionSchedule,
+) -> CandleAlignmentMap {
     catalog
         .instruments()
         .map(|instrument| {
             (
                 instrument.instrument_name.to_string(),
-                CandleAlignment::for_instrument(instrument),
+                CandleAlignment::for_instrument(instrument, market_sessions),
             )
         })
         .collect()

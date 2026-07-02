@@ -1,6 +1,9 @@
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::adapters::angelone::auth::{
+    current_session as current_angelone_session, login as login_angelone,
+};
 use crate::adapters::dbinternational::auth::{
     current_interactive_session, current_market_data_session, login_interactive, login_market_data,
 };
@@ -118,6 +121,26 @@ fn login_broker(broker_configs: &BrokersSection, broker: &str) -> Result<(), Fee
                     summary.user_id.as_deref().unwrap_or("-"),
                     summary.token_file,
                     summary.session_file.as_deref().unwrap_or("-")
+                );
+            }
+            Ok(())
+        }
+        "ANGELONE" | "ANGEL" | "ANGEL_ONE" => {
+            let Some(config) = &broker_configs.angelone else {
+                return Ok(());
+            };
+
+            let now = now_unix_seconds();
+            if let Some(session) = current_angelone_session(config, now)? {
+                println!(
+                    "AngelOne login skipped: current session client_code={}",
+                    session.client_code
+                );
+            } else {
+                let summary = login_angelone(config, None)?;
+                println!(
+                    "AngelOne login ok client_code={} session_file={}",
+                    summary.client_code, summary.session_file
                 );
             }
             Ok(())

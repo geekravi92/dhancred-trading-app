@@ -5,17 +5,19 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::adapters::angelone::auth::{AngeloneLoginSummary, login as login_angelone};
 use crate::adapters::dbinternational::auth::{
     DbinternationalLoginSummary, login_all, login_interactive, login_market_data,
 };
 use crate::adapters::fyers::token::write_access_token;
-use crate::config::{AppConfig, DbinternationalBrokerSection};
+use crate::config::{AngeloneBrokerSection, AppConfig, DbinternationalBrokerSection};
 use crate::feeder::FeedError;
 use crate::strategy::StrategyRuntimeHandle;
 
 const DBINTERNATIONAL_LOGIN_PATH: &str = "/admin/dbinternational/login";
 const DBINTERNATIONAL_MARKET_DATA_LOGIN_PATH: &str = "/admin/dbinternational/login/market-data";
 const DBINTERNATIONAL_INTERACTIVE_LOGIN_PATH: &str = "/admin/dbinternational/login/interactive";
+const ANGELONE_LOGIN_PATH: &str = "/admin/angelone/login";
 const FYERS_ACCESS_TOKEN_PATH: &str = "/admin/fyers/access-token";
 const STRATEGY_RELOAD_PATH: &str = "/admin/strategy/reload";
 const MAX_REQUEST_BYTES: usize = 16 * 1024;
@@ -27,6 +29,7 @@ pub struct AdminServerHandle {
 struct AdminState {
     fyers_access_token_file: Option<String>,
     dbinternational: Option<DbinternationalBrokerSection>,
+    angelone: Option<AngeloneBrokerSection>,
     strategy_runtime: Option<Arc<StrategyRuntimeHandle>>,
 }
 
@@ -60,6 +63,7 @@ pub fn start_admin_server(
             .as_ref()
             .map(|config| config.access_token_file.clone()),
         dbinternational: config.brokers.dbinternational.clone(),
+        angelone: config.brokers.angelone.clone(),
         strategy_runtime,
     };
     let listener = TcpListener::bind(bind_addr)?;
@@ -118,6 +122,18 @@ fn handle_connection(mut stream: TcpStream, state: &AdminState) -> Result<(), Fe
                 login_interactive(config).map(|summary| vec![summary]),
             )
         }
+        ("POST", ANGELONE_LOGIN_PATH) => {
+            let Some(config) = angelone_config(state) else {
+                return write_response(&mut stream, 404, "AngelOne config disabled\n");
+            };
+            let totp = request
+                .body
+                .trim()
+                .split_whitespace()
+                .next()
+                .filter(|value| !value.is_empty());
+            write_angelone_login_result(&mut stream, login_angelone(config, totp))
+        }
         ("POST", STRATEGY_RELOAD_PATH) => {
             let Some(strategy_runtime) = state.strategy_runtime.as_ref() else {
                 return write_response(&mut stream, 404, "strategy runtime disabled\n");
@@ -133,12 +149,26 @@ fn dbinternational_config(state: &AdminState) -> Option<&DbinternationalBrokerSe
     state.dbinternational.as_ref()
 }
 
+fn angelone_config(state: &AdminState) -> Option<&AngeloneBrokerSection> {
+    state.angelone.as_ref()
+}
+
 fn write_login_result(
     stream: &mut TcpStream,
     result: Result<Vec<DbinternationalLoginSummary>, FeedError>,
 ) -> Result<(), FeedError> {
     match result {
         Ok(summaries) => write_response(stream, 200, &format_login_summaries(&summaries)),
+        Err(error) => write_response(stream, 500, &format!("login failed: {error}\n")),
+    }
+}
+
+fn write_angelone_login_result(
+    stream: &mut TcpStream,
+    result: Result<AngeloneLoginSummary, FeedError>,
+) -> Result<(), FeedError> {
+    match result {
+        Ok(summary) => write_response(stream, 200, &format_angelone_login_summary(&summary)),
         Err(error) => write_response(stream, 500, &format!("login failed: {error}\n")),
     }
 }
@@ -161,6 +191,13 @@ fn format_login_summaries(summaries: &[DbinternationalLoginSummary]) -> String {
     }
     lines.push(String::new());
     lines.join("\n")
+}
+
+fn format_angelone_login_summary(summary: &AngeloneLoginSummary) -> String {
+    format!(
+        "AngelOne login completed\nclient_code={} session_file={}\n",
+        summary.client_code, summary.session_file
+    )
 }
 
 struct HttpRequest {
@@ -301,5 +338,17 @@ mod tests {
         assert!(body.contains("market_data user_id=ABC"));
         assert!(body.contains("token_file=runtime/secrets/token"));
         assert!(!body.contains("token-value"));
+    }
+
+    #[test]
+    fn formats_angelone_login_summary_without_token_value() {
+        let body = format_angelone_login_summary(&AngeloneLoginSummary {
+            client_code: "ABC".to_string(),
+            session_file: "runtime/secrets/angelone_session.json".to_string(),
+        });
+
+        assert!(body.contains("client_code=ABC"));
+        assert!(body.contains("session_file=runtime/secrets/angelone_session.json"));
+        assert!(!body.contains("jwt"));
     }
 }

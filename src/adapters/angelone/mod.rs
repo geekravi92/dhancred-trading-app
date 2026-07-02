@@ -1,17 +1,18 @@
-pub mod historical;
+pub mod auth;
 pub mod latest_price_file;
 pub mod live;
 pub mod master;
 pub mod runtime;
-pub mod token;
+pub mod universe;
 
-use crate::config::{FyersBrokerSection, HistoricalCandlesSection, MarketSessionSection};
-use crate::feeder::FeedError;
-use crate::strategy::StrategyRuntimeHandle;
 use std::sync::Arc;
 
+use crate::config::{AngeloneBrokerSection, HistoricalCandlesSection, MarketSessionSection};
+use crate::feeder::FeedError;
+use crate::strategy::StrategyRuntimeHandle;
+
 pub fn run_live(
-    config: &FyersBrokerSection,
+    config: &AngeloneBrokerSection,
     market_sessions: &[MarketSessionSection],
     historical_candles_config: Option<&HistoricalCandlesSection>,
     strategy_runtime: Option<Arc<StrategyRuntimeHandle>>,

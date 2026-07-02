@@ -1,3 +1,4 @@
+pub mod angelone;
 pub mod dbinternational;
 pub mod delta;
 pub mod fyers;
@@ -48,11 +49,13 @@ pub fn run_feed_brokers(
                         FeedError::Config("missing brokers.fyers config".to_string())
                     })?;
 
+                let market_sessions = config.market_sessions.clone();
                 let historical_candles = config.historical_candles.clone();
                 let strategy_runtime = strategy_runtime.clone();
                 spawn_broker(&mut handles, "FYERS", move || {
                     fyers::run_live(
                         &fyers_config,
+                        &market_sessions,
                         historical_candles.as_ref(),
                         strategy_runtime.clone(),
                         max_events,
@@ -70,6 +73,24 @@ pub fn run_feed_brokers(
                 spawn_broker(&mut handles, "DBINTERNATIONAL", move || {
                     dbinternational::runtime::run_live(
                         &dbinternational_config,
+                        historical_candles.as_ref(),
+                        strategy_runtime.clone(),
+                        max_events,
+                    )
+                });
+            }
+            "ANGELONE" | "ANGEL" | "ANGEL_ONE" => {
+                let angelone_config = config.brokers.angelone.clone().ok_or_else(|| {
+                    FeedError::Config("missing brokers.angelone config".to_string())
+                })?;
+
+                let market_sessions = config.market_sessions.clone();
+                let historical_candles = config.historical_candles.clone();
+                let strategy_runtime = strategy_runtime.clone();
+                spawn_broker(&mut handles, "ANGELONE", move || {
+                    angelone::run_live(
+                        &angelone_config,
+                        &market_sessions,
                         historical_candles.as_ref(),
                         strategy_runtime.clone(),
                         max_events,

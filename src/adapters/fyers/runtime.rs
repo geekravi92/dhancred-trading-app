@@ -9,19 +9,21 @@ use crate::adapters::fyers::master::{
     FyersUniverseSummary, build_fyers_universe_summary_from_master_csvs, refresh_all,
     selected_trading_symbols, write_fyers_derivatives_csv,
 };
-use crate::adapters::fyers::session;
 use crate::adapters::historical::{recover_spot_history, start_spot_history_maintenance};
-use crate::config::{FyersBrokerSection, HistoricalCandlesSection, InstrumentSelection};
+use crate::config::{
+    FyersBrokerSection, HistoricalCandlesSection, InstrumentSelection, MarketSessionSection,
+};
 use crate::feeder::{
     FeedError, InstrumentCatalog, InstrumentDefinition, InstrumentType, PriceEvent,
     RefreshDecision, SubscriptionDiff, UniverseRefreshState,
-    historical_candles::HistoricalCandleService,
+    historical_candles::HistoricalCandleService, wait_for_any_exchange_session,
 };
 use crate::notification::notify_recovery;
 use crate::strategy::StrategyRuntimeHandle;
 
 pub fn run_live(
     config: &FyersBrokerSection,
+    market_sessions: &[MarketSessionSection],
     historical_candles_config: Option<&HistoricalCandlesSection>,
     strategy_runtime: Option<Arc<StrategyRuntimeHandle>>,
     max_events: usize,
@@ -67,7 +69,7 @@ pub fn run_live(
     )?;
     let mut historical_candles =
         HistoricalCandleService::new(historical_candles_config, &base_catalog)?;
-    session::wait_for_market_session(config.market_sessions.as_deref())?;
+    wait_for_any_exchange_session(market_sessions, catalog_exchanges(&base_catalog))?;
     let mut live_feeder =
         FyersLiveFeeder::connect(&config.data_ws_url, access_token.trim(), log_to_console)?;
 
@@ -130,6 +132,14 @@ pub fn run_live(
         max_events,
         log_to_console,
     )
+}
+
+fn catalog_exchanges(catalog: &InstrumentCatalog) -> Vec<String> {
+    catalog
+        .instruments()
+        .filter(|instrument| instrument.tradable)
+        .map(|instrument| instrument.exchange.clone())
+        .collect()
 }
 
 #[derive(Clone, Debug)]

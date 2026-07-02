@@ -6,7 +6,7 @@ use rusqlite::params;
 
 use crate::config::AppConfig;
 use crate::feeder::{
-    CandleAlignmentMap, InstrumentCatalog, InstrumentType, Timeframe,
+    CandleAlignmentMap, InstrumentCatalog, InstrumentType, MarketSessionSchedule, Timeframe,
     candle_alignments_from_catalog, merge_candle_alignments,
 };
 use crate::notification::notify_message;
@@ -1183,11 +1183,24 @@ fn load_spot_instruments(config: &AppConfig) -> Result<Vec<String>, StrategyErro
         collect_spot_instruments(&catalog, &mut instruments);
     }
 
+    if config.feed_broker_enabled("ANGELONE") {
+        let Some(angelone) = config.brokers.angelone.as_ref() else {
+            return Err(StrategyError::Config(
+                "missing brokers.angelone config".to_string(),
+            ));
+        };
+        let catalog = InstrumentCatalog::load_csv(&angelone.base_instruments_csv)
+            .map_err(|error| StrategyError::Config(error.to_string()))?;
+        collect_spot_instruments(&catalog, &mut instruments);
+    }
+
     Ok(instruments.into_iter().collect())
 }
 
 fn load_candle_alignments(config: &AppConfig) -> Result<CandleAlignmentMap, StrategyError> {
     let mut alignments = CandleAlignmentMap::new();
+    let market_sessions = MarketSessionSchedule::from_configs(&config.market_sessions)
+        .map_err(|error| StrategyError::Config(error.to_string()))?;
 
     if config.feed_broker_enabled("DELTA") {
         let Some(delta) = config.brokers.delta.as_ref() else {
@@ -1197,7 +1210,10 @@ fn load_candle_alignments(config: &AppConfig) -> Result<CandleAlignmentMap, Stra
         };
         let catalog = InstrumentCatalog::load_csv(&delta.base_instruments_csv)
             .map_err(|error| StrategyError::Config(error.to_string()))?;
-        merge_candle_alignments(&mut alignments, candle_alignments_from_catalog(&catalog));
+        merge_candle_alignments(
+            &mut alignments,
+            candle_alignments_from_catalog(&catalog, &market_sessions),
+        );
     }
 
     if config.feed_broker_enabled("FYERS") {
@@ -1208,7 +1224,24 @@ fn load_candle_alignments(config: &AppConfig) -> Result<CandleAlignmentMap, Stra
         };
         let catalog = InstrumentCatalog::load_csv(&fyers.base_instruments_csv)
             .map_err(|error| StrategyError::Config(error.to_string()))?;
-        merge_candle_alignments(&mut alignments, candle_alignments_from_catalog(&catalog));
+        merge_candle_alignments(
+            &mut alignments,
+            candle_alignments_from_catalog(&catalog, &market_sessions),
+        );
+    }
+
+    if config.feed_broker_enabled("ANGELONE") {
+        let Some(angelone) = config.brokers.angelone.as_ref() else {
+            return Err(StrategyError::Config(
+                "missing brokers.angelone config".to_string(),
+            ));
+        };
+        let catalog = InstrumentCatalog::load_csv(&angelone.base_instruments_csv)
+            .map_err(|error| StrategyError::Config(error.to_string()))?;
+        merge_candle_alignments(
+            &mut alignments,
+            candle_alignments_from_catalog(&catalog, &market_sessions),
+        );
     }
 
     Ok(alignments)

@@ -3,8 +3,8 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 use crate::feeder::FeedError;
 
@@ -19,6 +19,8 @@ pub struct AppConfig {
     pub admin: Option<AdminSection>,
     pub master_scheduler: Option<MasterSchedulerSection>,
     pub login_scheduler: Option<LoginSchedulerSection>,
+    #[serde(default)]
+    pub market_sessions: Vec<MarketSessionSection>,
     pub channels: ChannelsSection,
     pub runtime: Option<RuntimeSection>,
     #[serde(skip)]
@@ -57,6 +59,10 @@ impl AppConfig {
             config_dir.join("dbinternational.toml"),
             self.brokers.dbinternational.take(),
         )?;
+        self.brokers.angelone = load_broker_file(
+            config_dir.join("angelone.toml"),
+            self.brokers.angelone.take(),
+        )?;
 
         Ok(())
     }
@@ -74,6 +80,7 @@ pub struct BrokersSection {
     pub delta: Option<DeltaBrokerSection>,
     pub fyers: Option<FyersBrokerSection>,
     pub dbinternational: Option<DbinternationalBrokerSection>,
+    pub angelone: Option<AngeloneBrokerSection>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -119,16 +126,22 @@ pub struct FyersBrokerSection {
     pub app_id_env: Option<String>,
     pub latest_prices_file: Option<String>,
     pub console_logging: Option<bool>,
-    pub market_sessions: Option<Vec<FyersMarketSessionSection>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct FyersMarketSessionSection {
-    pub name: String,
+pub struct MarketSessionSection {
+    pub id: String,
+    pub exchanges: Vec<String>,
     pub timezone: String,
-    pub open_ist: String,
-    pub close_ist: String,
+    #[serde(default)]
+    pub open: Option<String>,
+    #[serde(default)]
+    pub close: Option<String>,
+    #[serde(default)]
+    pub always_open: bool,
+    #[serde(default)]
     pub connect_before_open_secs: u64,
+    #[serde(default)]
     pub weekdays_only: bool,
 }
 
@@ -141,14 +154,25 @@ pub struct DbinternationalBrokerSection {
     pub market_data_session_file: Option<String>,
     pub market_data_master_file: String,
     pub market_data_exchange_segments: Vec<String>,
+    #[serde(default = "default_dbinternational_index_file")]
+    pub market_data_index_file: String,
+    #[serde(default = "default_dbinternational_index_exchange_segments")]
+    pub market_data_index_exchange_segments: Vec<String>,
     #[serde(default = "default_dbinternational_socket_path")]
     pub market_data_socket_path: String,
     #[serde(default = "default_dbinternational_publish_format")]
     pub market_data_publish_format: String,
     #[serde(default = "default_dbinternational_broadcast_mode")]
     pub market_data_broadcast_mode: String,
-    #[serde(default)]
-    pub market_data_subscribe_symbols: Vec<String>,
+    pub market_data_subscription_limit: Option<usize>,
+    #[serde(default = "default_dbinternational_derivatives_csv")]
+    pub derivatives_csv: String,
+    #[serde(default = "default_dbinternational_instrument_types")]
+    pub instrument_types: Vec<String>,
+    #[serde(default = "default_dbinternational_strike_distance_pct")]
+    pub strike_distance_pct: f64,
+    #[serde(default = "default_dbinternational_refresh_trigger_pct")]
+    pub refresh_trigger_pct: f64,
     pub latest_prices_file: Option<String>,
     pub interactive_base_url: String,
     pub interactive_app_key_env: String,
@@ -181,6 +205,53 @@ impl DbinternationalBrokerSection {
         format!(
             "{}/user/session",
             self.interactive_base_url.trim_end_matches('/')
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AngeloneBrokerSection {
+    pub rest_base_url: String,
+    pub websocket_url: String,
+    pub master_url: String,
+    pub api_key_env: String,
+    pub client_code_env: String,
+    pub password_env: String,
+    pub totp_code_env: Option<String>,
+    pub totp_secret_env: Option<String>,
+    #[serde(default = "default_angelone_state")]
+    pub state: String,
+    #[serde(default = "default_angelone_client_local_ip")]
+    pub client_local_ip: String,
+    #[serde(default = "default_angelone_client_public_ip")]
+    pub client_public_ip: String,
+    #[serde(default)]
+    pub mac_address: String,
+    pub session_file: String,
+    pub master_file: String,
+    pub base_instruments_csv: String,
+    pub derivatives_csv: String,
+    #[serde(default = "default_angelone_instrument_types")]
+    pub instrument_types: Vec<String>,
+    #[serde(default = "default_angelone_strike_distance_pct")]
+    pub strike_distance_pct: f64,
+    #[serde(default = "default_angelone_refresh_trigger_pct")]
+    pub refresh_trigger_pct: f64,
+    #[serde(default = "default_angelone_websocket_mode")]
+    pub websocket_mode: u8,
+    #[serde(default = "default_angelone_subscription_limit")]
+    pub websocket_subscription_limit: usize,
+    #[serde(default = "default_angelone_subscription_batch_size")]
+    pub websocket_subscription_batch_size: usize,
+    pub latest_prices_file: Option<String>,
+    pub console_logging: Option<bool>,
+}
+
+impl AngeloneBrokerSection {
+    pub fn login_url(&self) -> String {
+        format!(
+            "{}/rest/auth/angelbroking/user/v1/loginByPassword",
+            self.rest_base_url.trim_end_matches('/')
         )
     }
 }
@@ -312,6 +383,26 @@ impl From<&FyersBrokerSection> for InstrumentSelection {
     }
 }
 
+impl From<&DbinternationalBrokerSection> for InstrumentSelection {
+    fn from(value: &DbinternationalBrokerSection) -> Self {
+        Self {
+            instrument_types: value.instrument_types.clone(),
+            strike_distance_pct: value.strike_distance_pct,
+            refresh_trigger_pct: value.refresh_trigger_pct,
+        }
+    }
+}
+
+impl From<&AngeloneBrokerSection> for InstrumentSelection {
+    fn from(value: &AngeloneBrokerSection) -> Self {
+        Self {
+            instrument_types: value.instrument_types.clone(),
+            strike_distance_pct: value.strike_distance_pct,
+            refresh_trigger_pct: value.refresh_trigger_pct,
+        }
+    }
+}
+
 fn env_from_name(name: &str) -> Result<String, FeedError> {
     env::var(name).map_err(|_| FeedError::Config(format!("missing environment variable {name}")))
 }
@@ -323,6 +414,7 @@ fn broker_name_matches(configured: &str, wanted: &str) -> bool {
 fn normalize_broker_name(value: &str) -> String {
     match value.trim().to_ascii_uppercase().as_str() {
         "DB" | "DBINTERNATIONAL" => "DBINTERNATIONAL".to_string(),
+        "ANGEL" | "ANGELONE" | "ANGEL_ONE" => "ANGELONE".to_string(),
         other => other.to_string(),
     }
 }
@@ -423,12 +515,72 @@ fn default_dbinternational_socket_path() -> String {
     "/apibinarymarketdata/socket.io".to_string()
 }
 
+fn default_dbinternational_index_file() -> String {
+    "data/instruments/dbinternational/master/indices.txt".to_string()
+}
+
+fn default_dbinternational_index_exchange_segments() -> Vec<String> {
+    vec!["NSECM".to_string(), "BSECM".to_string()]
+}
+
 fn default_dbinternational_publish_format() -> String {
     "JSON".to_string()
 }
 
 fn default_dbinternational_broadcast_mode() -> String {
     "Full".to_string()
+}
+
+fn default_dbinternational_derivatives_csv() -> String {
+    "data/instruments/dbinternational/derivatives.csv".to_string()
+}
+
+fn default_dbinternational_instrument_types() -> Vec<String> {
+    vec!["FUT".to_string(), "CALL".to_string(), "PUT".to_string()]
+}
+
+fn default_dbinternational_strike_distance_pct() -> f64 {
+    3.0
+}
+
+fn default_dbinternational_refresh_trigger_pct() -> f64 {
+    3.0
+}
+
+fn default_angelone_state() -> String {
+    "dhancred".to_string()
+}
+
+fn default_angelone_client_local_ip() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_angelone_client_public_ip() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_angelone_instrument_types() -> Vec<String> {
+    vec!["FUT".to_string(), "CALL".to_string(), "PUT".to_string()]
+}
+
+fn default_angelone_strike_distance_pct() -> f64 {
+    3.0
+}
+
+fn default_angelone_refresh_trigger_pct() -> f64 {
+    3.0
+}
+
+fn default_angelone_websocket_mode() -> u8 {
+    1
+}
+
+fn default_angelone_subscription_limit() -> usize {
+    1_000
+}
+
+fn default_angelone_subscription_batch_size() -> usize {
+    500
 }
 
 fn default_strategy_warmup_bars() -> usize {
@@ -536,6 +688,8 @@ market_data_token_file = "runtime/secrets/db_market_token"
 market_data_session_file = "runtime/secrets/db_market_session.json"
 market_data_master_file = "data/instruments/dbinternational/master/instruments.txt"
 market_data_exchange_segments = ["NSECM", "NSEFO"]
+market_data_index_file = "data/instruments/dbinternational/master/indices.txt"
+derivatives_csv = "data/instruments/dbinternational/derivatives.csv"
 interactive_base_url = "interactive"
 interactive_app_key_env = "DB_INTERACTIVE_APP"
 interactive_secret_key_env = "DB_INTERACTIVE_SECRET"

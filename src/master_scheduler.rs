@@ -1,6 +1,7 @@
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::adapters::angelone::master as angelone_master;
 use crate::adapters::dbinternational::master as dbinternational_master;
 use crate::adapters::delta::product_master::{DeltaProductClient, ensure_delta_master_csv};
 use crate::adapters::fyers::master as fyers_master;
@@ -122,12 +123,37 @@ fn refresh_broker_master(broker_configs: &BrokersSection, broker: &str) -> Resul
             dbinternational_master::ensure_master_current(config).map(|summary| {
                 if summary.refreshed {
                     println!(
-                        "DBInternational master refreshed: {} instruments | {}",
+                        "DBInternational master refreshed: {} instruments | {} | {} indices | {}",
+                        summary.instrument_count,
+                        summary.output_path,
+                        summary.index_count,
+                        summary.index_output_path
+                    );
+                } else {
+                    println!(
+                        "DBInternational master skipped: current files have {} instruments | {} | {} indices | {}",
+                        summary.instrument_count,
+                        summary.output_path,
+                        summary.index_count,
+                        summary.index_output_path
+                    );
+                }
+            })
+        }
+        "ANGELONE" | "ANGEL" | "ANGEL_ONE" => {
+            let Some(config) = &broker_configs.angelone else {
+                return Ok(());
+            };
+
+            angelone_master::ensure_master_current(config).map(|summary| {
+                if summary.refreshed {
+                    println!(
+                        "AngelOne master refreshed: {} instruments | {}",
                         summary.instrument_count, summary.output_path
                     );
                 } else {
                     println!(
-                        "DBInternational master skipped: current file has {} instruments | {}",
+                        "AngelOne master skipped: current file has {} instruments | {}",
                         summary.instrument_count, summary.output_path
                     );
                 }

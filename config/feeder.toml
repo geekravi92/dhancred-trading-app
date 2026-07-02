@@ -1,6 +1,6 @@
 [feeder]
 mode = "live"
-feed_brokers = ["DBINTERNATIONAL"]
+feed_brokers = ["ANGELONE"]
 
 [brokers]
 config_dir = "brokers"
@@ -18,6 +18,48 @@ weekdays_only = false
 enabled = true
 time_ist = "07:55"
 weekdays_only = false
+
+[[market_sessions]]
+id = "NSE_BSE"
+exchanges = ["NSE", "NFO", "BSE", "BFO"]
+timezone = "Asia/Kolkata"
+open = "09:15"
+close = "15:30"
+connect_before_open_secs = 300
+weekdays_only = true
+
+[[market_sessions]]
+id = "INDIA_CURRENCY"
+exchanges = ["CDS"]
+timezone = "Asia/Kolkata"
+open = "09:00"
+close = "17:00"
+connect_before_open_secs = 300
+weekdays_only = true
+
+[[market_sessions]]
+id = "MCX"
+exchanges = ["MCX"]
+timezone = "Asia/Kolkata"
+open = "09:00"
+close = "23:30"
+connect_before_open_secs = 300
+weekdays_only = true
+
+[[market_sessions]]
+id = "NCDEX"
+exchanges = ["NCDEX", "NCO"]
+timezone = "Asia/Kolkata"
+open = "09:00"
+close = "17:00"
+connect_before_open_secs = 300
+weekdays_only = true
+
+[[market_sessions]]
+id = "CRYPTO"
+exchanges = ["DELTA"]
+timezone = "UTC"
+always_open = true
 
 [channels]
 price_tick = true
